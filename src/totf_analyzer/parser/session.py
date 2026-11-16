@@ -24,6 +24,8 @@ from totf_analyzer.parser.t2sr import (
 CORNER_COLOR = {1: "blue", 2: "red"}
 COLOR_CORNER = {"red": 2, "blue": 1}
 STANCE_BY_CODE = {1: "orthodox"}
+# Used when a track snapshot does not publish m_scaledHandLength.
+DEFAULT_HAND_LENGTH_M = 0.095
 
 
 @dataclass
@@ -36,6 +38,7 @@ class TrackData:
     stance: str | None
     stance_confirmed: bool
     height_m: float | None
+    hand_length_m: float
     ai_archetype: str | None
     ai_difficulty: str | None
     start_tick: int
@@ -114,6 +117,14 @@ def _height(track_meta: dict) -> float | None:
     return None
 
 
+def _hand_length(track_meta: dict) -> float:
+    snapshot = track_meta.get("m_snapshot") or {}
+    length = snapshot.get("m_scaledHandLength")
+    if isinstance(length, (int, float)) and float(length) > 0:
+        return float(length)
+    return DEFAULT_HAND_LENGTH_M
+
+
 def _read_track(zf: zipfile.ZipFile, folder: str, meta: dict, origin: int) -> TrackData:
     corner = int(meta["m_corner"])
     color = CORNER_COLOR.get(corner)
@@ -134,6 +145,7 @@ def _read_track(zf: zipfile.ZipFile, folder: str, meta: dict, origin: int) -> Tr
         stance=stance,
         stance_confirmed=stance_confirmed,
         height_m=_height(meta),
+        hand_length_m=_hand_length(meta),
         ai_archetype=ai.get("m_archetype"),
         ai_difficulty=ai.get("m_difficulty"),
         start_tick=int(meta["m_startTick"]),

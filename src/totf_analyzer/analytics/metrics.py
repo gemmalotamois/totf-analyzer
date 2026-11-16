@@ -26,7 +26,18 @@ from totf_analyzer.models.analytics import (
     VelocityStats,
 )
 from totf_analyzer.parser.session import COLOR_CORNER, CORNER_COLOR, ParsedSession, TrackData
-from totf_analyzer.parser.t2sr import EventRecord, PunchRecord
+from totf_analyzer.parser.t2sr import (
+    HAND_LABEL,
+    HEAD,
+    HIPS,
+    L_ELBOW,
+    L_WRIST,
+    PUNCH_CLASS_LABEL,
+    R_ELBOW,
+    R_WRIST,
+    EventRecord,
+    PunchRecord,
+)
 
 # Hands count as "up" when both are within these distances of the head joint.
 GUARD_DY_MAX = 0.38
@@ -34,8 +45,16 @@ GUARD_HORIZ_MAX = 0.40
 # Opponent punch records mark the surrounding ticks as under fire.
 UNDER_FIRE_BEFORE = 6
 UNDER_FIRE_AFTER = 36
-# A scored-hit event links to the nearest unused punch inside this window.
-HIT_MATCH_TICKS = 36
+# A scored hit links to a punch when it falls in [launch_tick - lead, end_tick + lag].
+HIT_LAUNCH_LEAD = 6
+HIT_END_LAG = 12
+# Launch-to-peak wrist displacement, as a unit vector in the opponent frame.
+UPPERCUT_UP = 0.45
+OVERHAND_DOWN = -0.35
+HOOK_LATERAL = 0.40
+STRAIGHT_FORWARD = 0.25
+MIN_EXTENSION_M = 0.02
+MIN_SKELETON_FRAMES = 3
 PUNISHMENT_LINK_TICKS = 48
 SPEED_BINS = (0.0, 6.0, 7.5, 8.5, 9.5, 12.0, 30.0)
 SERIES_STEP_SEC = 0.25
@@ -64,11 +83,13 @@ def build_analytics(session: ParsedSession) -> FightAnalytics:
     rounds = _rounds(session)
     totals = _score_totals(rounds)
     fighters = [_fighter(track, notes) for track in _ordered(session)]
-    labels = {
-        corner: _hand_labels(track, _body(track), notes) for corner, track in session.tracks.items()
-    }
+    labels = {corner: _hand_labels(track, notes) for corner, track in session.tracks.items()}
     windows = _round_windows(session)
-    offense, defense, moments, series = _measure(session, labels, totals, notes, clock_ticks=_clock_ticks(windows))
+    active = _within_windows(session, windows)
+    pace = sum(window.duration_sec for window in windows) if windows else None
+    offense, defense, moments, series = _measure(
+        active, labels, totals, notes, pace_sec=pace, clock_ticks=_clock_ticks(windows)
+    )
     _attach_rounds(session, rounds, labels, windows)
     notes.extend(_static_notes())
     return FightAnalytics(
@@ -344,6 +365,7 @@ def _clip_track(track: TrackData, start: int, end: int) -> TrackData:
         stance=track.stance,
         stance_confirmed=track.stance_confirmed,
         height_m=track.height_m,
+        hand_length_m=track.hand_length_m,
         ai_archetype=track.ai_archetype,
         ai_difficulty=track.ai_difficulty,
         start_tick=start,
@@ -358,6 +380,66 @@ def _clip_track(track: TrackData, start: int, end: int) -> TrackData:
         guard_primary=track.guard_primary[guard],
         skeleton_ticks=track.skeleton_ticks[skeleton],
         skeleton_pos=track.skeleton_pos[skeleton],
+    )
+
+
+def _window_mask(ticks: np.ndarray, windows: list[_RoundWindow]) -> np.ndarray:
+    if len(ticks) == 0:
+        return np.zeros(0, dtype=bool)
+    values = ticks.astype(np.int64, copy=False)
+    mask = np.zeros(len(values), dtype=bool)
+    for window in windows:
+        mask |= (values >= window.warning_tick) & (values <= window.stats_end)
+    return mask
+
+
+def _filter_track(track: TrackData, windows: list[_RoundWindow]) -> TrackData:
+    skeleton = _window_mask(track.skeleton_ticks, windows)
+    punishment = _window_mask(track.punishment_ticks, windows)
+    stiffness = _window_mask(track.stiffness_ticks, windows)
+    guard = _window_mask(track.guard_ticks, windows)
+
+    def inside(tick: int) -> bool:
+        return any(window.warning_tick <= tick <= window.stats_end for window in windows)
+
+    return TrackData(
+        folder=track.folder,
+        corner=track.corner,
+        color=track.color,
+        name=track.name,
+        is_local_player=track.is_local_player,
+        stance=track.stance,
+        stance_confirmed=track.stance_confirmed,
+        height_m=track.height_m,
+        hand_length_m=track.hand_length_m,
+        ai_archetype=track.ai_archetype,
+        ai_difficulty=track.ai_difficulty,
+        start_tick=track.start_tick,
+        end_tick=track.end_tick,
+        punches=[punch for punch in track.punches if inside(punch.tick)],
+        events=[event for event in track.events if inside(event.tick)],
+        punishment_ticks=track.punishment_ticks[punishment],
+        punishment=track.punishment[punishment],
+        stiffness_ticks=track.stiffness_ticks[stiffness],
+        stiffness=track.stiffness[stiffness],
+        guard_ticks=track.guard_ticks[guard],
+        guard_primary=track.guard_primary[guard],
+        skeleton_ticks=track.skeleton_ticks[skeleton],
+        skeleton_pos=track.skeleton_pos[skeleton],
+    )
+
+
+def _within_windows(session: ParsedSession, windows: list[_RoundWindow]) -> ParsedSession:
+    """Keep bell-to-bell samples. The fight clock (start_tick) stays where it is."""
+    if not windows:
+        return session
+    return ParsedSession(
+        path=session.path,
+        metadata=session.metadata,
+        fixed_timestep=session.fixed_timestep,
+        start_tick=session.start_tick,
+        end_tick=session.end_tick,
+        tracks={corner: _filter_track(track, windows) for corner, track in session.tracks.items()},
     )
 
 
@@ -384,6 +466,7 @@ def _drop_clock_events(track: TrackData, clock: set[int]) -> TrackData:
         stance=track.stance,
         stance_confirmed=track.stance_confirmed,
         height_m=track.height_m,
+        hand_length_m=track.hand_length_m,
         ai_archetype=track.ai_archetype,
         ai_difficulty=track.ai_difficulty,
         start_tick=track.start_tick,
@@ -481,128 +564,231 @@ def _score_totals(rounds: list[RoundScore]) -> dict[int, dict]:
     return totals
 
 
-def _trajectory(direction: tuple[float, float, float] | None) -> str:
-    if direction is None:
-        return "unknown"
-    x, y, z = direction
-    mag = math.sqrt(x * x + y * y + z * z)
-    if mag < 0.25:
-        return "unknown"
-    x, y, z = x / mag, y / mag, z / mag
-    if y >= 0.45:
-        return "uppercut"
-    if y <= -0.35 and abs(x) >= abs(z):
-        return "overhand"
-    if abs(z) >= 0.40 and abs(z) >= abs(x):
-        return "hook"
-    return "straight"
+def _extend_past_wrist(wrist: np.ndarray, elbow: np.ndarray, reach: float) -> np.ndarray:
+    direction = wrist.astype(np.float64) - elbow.astype(np.float64)
+    length = np.linalg.norm(direction, axis=1, keepdims=True)
+    unit = np.divide(direction, length, out=np.zeros_like(direction), where=length > 1.0e-6)
+    return wrist.astype(np.float64) + unit * reach
+
+
+def _glove_centers(track: TrackData) -> tuple[np.ndarray, np.ndarray]:
+    """Wrist extended half a hand length along the forearm, per hand."""
+    pos = track.skeleton_pos
+    reach = 0.5 * float(track.hand_length_m)
+    left = _extend_past_wrist(pos[:, L_WRIST], pos[:, L_ELBOW], reach)
+    right = _extend_past_wrist(pos[:, R_WRIST], pos[:, R_ELBOW], reach)
+    return left, right
 
 
 def _body(track: TrackData) -> dict:
+    ticks = track.skeleton_ticks.astype(np.int64)
     pos = track.skeleton_pos
     if len(pos) == 0:
         return {
-            "head": 0,
+            "head": HEAD,
             "left": None,
             "right": None,
-            "ticks": track.skeleton_ticks.astype(np.int64),
+            "ticks": ticks,
             "guard": np.zeros(0, dtype=bool),
             "head_xyz": np.zeros((0, 3), dtype=np.float64),
         }
-    med = np.median(pos, axis=0)
-    speed = np.linalg.norm(np.diff(pos, axis=0), axis=2).mean(axis=0)
-    head = int(np.argmax(med[:, 1]))
-    head_y = float(med[head, 1])
-    head_z = float(med[head, 2])
-    candidates = []
-    for joint in range(pos.shape[1]):
-        if joint == head:
-            continue
-        height = float(med[joint, 1])
-        if not head_y - 0.75 < height < head_y - 0.05:
-            continue
-        if abs(float(med[joint, 2]) - head_z) < 0.03:
-            continue
-        candidates.append(joint)
-    left = [joint for joint in candidates if float(med[joint, 2]) < head_z]
-    right = [joint for joint in candidates if float(med[joint, 2]) > head_z]
-    left_joint = max(left, key=lambda joint: float(speed[joint])) if left else None
-    right_joint = max(right, key=lambda joint: float(speed[joint])) if right else None
-    ticks = track.skeleton_ticks.astype(np.int64)
-    guard = np.zeros(len(ticks), dtype=bool)
-    if left_joint is not None and right_joint is not None:
-        dy_l = pos[:, head, 1] - pos[:, left_joint, 1]
-        dy_r = pos[:, head, 1] - pos[:, right_joint, 1]
-        horiz_l = np.linalg.norm(pos[:, left_joint][:, [0, 2]] - pos[:, head][:, [0, 2]], axis=1)
-        horiz_r = np.linalg.norm(pos[:, right_joint][:, [0, 2]] - pos[:, head][:, [0, 2]], axis=1)
-        guard = (dy_l < GUARD_DY_MAX) & (dy_r < GUARD_DY_MAX) & (horiz_l < GUARD_HORIZ_MAX) & (
-            horiz_r < GUARD_HORIZ_MAX
-        )
-    head_xyz = pos[:, head, :]
+    left_glove, right_glove = _glove_centers(track)
+    head_xyz = pos[:, HEAD, :].astype(np.float64)
+    dy_l = head_xyz[:, 1] - left_glove[:, 1]
+    dy_r = head_xyz[:, 1] - right_glove[:, 1]
+    horiz_l = np.linalg.norm(left_glove[:, [0, 2]] - head_xyz[:, [0, 2]], axis=1)
+    horiz_r = np.linalg.norm(right_glove[:, [0, 2]] - head_xyz[:, [0, 2]], axis=1)
+    guard = (dy_l < GUARD_DY_MAX) & (dy_r < GUARD_DY_MAX) & (horiz_l < GUARD_HORIZ_MAX) & (
+        horiz_r < GUARD_HORIZ_MAX
+    )
     return {
-        "head": head,
-        "left": left_joint,
-        "right": right_joint,
+        "head": HEAD,
+        "left": L_WRIST,
+        "right": R_WRIST,
         "ticks": ticks,
         "guard": guard,
         "head_xyz": head_xyz,
     }
 
 
-def _majority_side(ballots: list[str]) -> str | None:
-    if len(ballots) < 8:
-        return None
-    left_share = ballots.count("left") / len(ballots)
-    if left_share >= 0.65:
-        return "left"
-    if left_share <= 0.35:
-        return "right"
+def _local_axes(track: TrackData, opponent: TrackData) -> tuple[np.ndarray, np.ndarray]:
+    """Per skeleton frame: horizontal forward toward the opponent, and the fighter's right."""
+    ticks = track.skeleton_ticks.astype(np.int64)
+    count = len(ticks)
+    if count == 0 or len(opponent.skeleton_ticks) == 0:
+        forward = np.zeros((count, 3), dtype=np.float64)
+        forward[:, 2] = 1.0
+        right = np.stack([forward[:, 2], np.zeros(count), -forward[:, 0]], axis=1)
+        return forward, right
+    opp_ticks = opponent.skeleton_ticks.astype(np.int64)
+    nearest = np.clip(np.searchsorted(opp_ticks, ticks, side="left"), 0, len(opp_ticks) - 1)
+    previous = np.clip(nearest - 1, 0, len(opp_ticks) - 1)
+    nearer_previous = np.abs(opp_ticks[previous] - ticks) < np.abs(opp_ticks[nearest] - ticks)
+    nearest = np.where(nearer_previous, previous, nearest)
+    opp = opponent.skeleton_pos[nearest].astype(np.float64)
+    mine = track.skeleton_pos.astype(np.float64)
+    delta = opp[:, HIPS] - mine[:, HIPS]
+    delta[:, 1] = 0.0
+    length = np.linalg.norm(delta, axis=1)
+    weak = length < 1.0e-3
+    if np.any(weak):
+        head_delta = opp[weak, HEAD] - mine[weak, HEAD]
+        head_delta[:, 1] = 0.0
+        delta[weak] = head_delta
+        length = np.linalg.norm(delta, axis=1)
+    good = length >= 1.0e-3
+    unit = np.zeros_like(delta)
+    unit[good] = delta[good] / length[good, None]
+    last = np.array([0.0, 0.0, 1.0])
+    for index in range(count):
+        if good[index]:
+            last = unit[index].copy()
+        else:
+            unit[index] = last
+    right = np.stack([unit[:, 2], np.zeros(count), -unit[:, 0]], axis=1)
+    return unit, right
+
+
+def _wrist_index(hand_index: int) -> int | None:
+    if hand_index == 1:
+        return L_WRIST
+    if hand_index == 0:
+        return R_WRIST
     return None
 
 
-def _hand_labels(track: TrackData, body: dict, notes: list[DecodeNote]) -> dict[int, str]:
-    default = {0: "hand_0", 1: "hand_1"}
-    if body["left"] is None or body["right"] is None or not track.punches:
-        notes.append(
-            DecodeNote(
-                field=f"offense.{track.corner}.hand",
-                confidence="unavailable",
-                note="Hand index is stored, but it could not be tied to left/right from the skeleton.",
-            )
-        )
-        return default
-    index_of = {int(tick): i for i, tick in enumerate(body["ticks"])}
-    votes: dict[int, list[str]] = defaultdict(list)
-    pos = track.skeleton_pos
+def _label_displacement(hand: str, displacement: np.ndarray) -> str:
+    magnitude = float(np.linalg.norm(displacement))
+    if magnitude < MIN_EXTENSION_M:
+        return "unknown"
+    forward, up, lateral = (float(component) / magnitude for component in displacement)
+    if up >= UPPERCUT_UP and up >= abs(forward) and up >= abs(lateral):
+        return "uppercut"
+    if up <= OVERHAND_DOWN and forward >= abs(lateral):
+        return "overhand"
+    if abs(lateral) >= HOOK_LATERAL and abs(lateral) >= forward:
+        return "left_hook" if hand == "left" else "right_hook"
+    if forward > STRAIGHT_FORWARD:
+        return "jab" if hand == "left" else "cross"
+    return "unknown"
+
+
+def _trajectory_family(label: str) -> str | None:
+    if label in {"jab", "cross"}:
+        return "straight"
+    if label in {"left_hook", "right_hook"}:
+        return "hook"
+    if label in {"uppercut", "overhand"}:
+        return label
+    return None
+
+
+def _skeleton_trajectory(
+    track: TrackData,
+    punch: PunchRecord,
+    forward: np.ndarray,
+    right: np.ndarray,
+) -> str:
+    wrist = _wrist_index(punch.hand_index)
+    hand = HAND_LABEL.get(punch.hand_index)
+    ticks = track.skeleton_ticks
+    if wrist is None or hand is None or len(ticks) == 0 or punch.launch_tick > punch.tick:
+        return "unknown"
+    lo = int(np.searchsorted(ticks, punch.launch_tick, side="left"))
+    hi = int(np.searchsorted(ticks, punch.tick, side="right"))
+    if hi - lo < MIN_SKELETON_FRAMES:
+        return "unknown"
+    points = track.skeleton_pos[lo:hi, wrist].astype(np.float64)
+    delta = points - points[0]
+    up = np.array([0.0, 1.0, 0.0])
+    local = np.column_stack((delta @ forward[lo], delta @ up, delta @ right[lo]))
+    peak = int(np.argmax(np.linalg.norm(local, axis=1)))
+    if peak == 0:
+        return "unknown"
+    return _label_displacement(hand, local[peak])
+
+
+def _punch_trajectories(track: TrackData, opponent: TrackData, notes: list[DecodeNote]) -> list[str]:
+    """Game class when byte 32 is set; otherwise the skeleton displacement label."""
+    forward, right = _local_axes(track, opponent)
+    labels: list[str] = []
+    game_count = 0
+    compared = 0
+    agreed = 0
     for punch in track.punches:
-        frame = index_of.get(punch.tick)
-        if frame is None or frame + 12 >= len(pos):
-            continue
-        window = pos[frame : frame + 12]
-        left_motion = float(np.linalg.norm(np.diff(window[:, body["left"]], axis=0), axis=1).sum())
-        right_motion = float(np.linalg.norm(np.diff(window[:, body["right"]], axis=0), axis=1).sum())
-        if left_motion == right_motion:
-            continue
-        votes[punch.hand_index].append("left" if left_motion > right_motion else "right")
-    side_0 = _majority_side(votes[0])
-    side_1 = _majority_side(votes[1])
-    if side_0 and side_1 and side_0 != side_1:
-        notes.append(
-            DecodeNote(
-                field=f"offense.{track.corner}.hand",
-                confidence="inferred",
-                note="Hand 0/1 was labeled left/right by which skeleton hand moved more at the punch tick.",
-            )
+        game = PUNCH_CLASS_LABEL.get(punch.punch_class)
+        skeleton = _skeleton_trajectory(track, punch, forward, right)
+        if game:
+            game_count += 1
+            game_family = _trajectory_family(game)
+            skeleton_family = _trajectory_family(skeleton)
+            if game_family is not None and skeleton_family is not None:
+                compared += 1
+                if game_family == skeleton_family:
+                    agreed += 1
+            labels.append(game)
+        else:
+            labels.append(skeleton)
+    if game_count and compared and agreed * 2 > compared:
+        confidence = "confirmed"
+        note = (
+            "Byte 32 is the punch class (1 jab, 2 cross, 3 left hook, 4 right hook, 6 uppercut). "
+            "The skeleton wrist family agreed on a majority of those punches."
         )
-        return {0: side_0, 1: side_1}
-    notes.append(
-        DecodeNote(
-            field=f"offense.{track.corner}.hand",
-            confidence="unavailable",
-            note="Punch records distinguish hand 0 and hand 1, but the skeleton vote was not consistent enough to call them left and right.",
+    elif game_count == 0:
+        confidence = "inferred"
+        note = (
+            "This track has no game punch class. Trajectory is the wrist displacement from launch "
+            "to peak extension in the opponent frame (forward, up, right)."
         )
-    )
-    return default
+    else:
+        confidence = "inferred"
+        note = (
+            "Byte 32 is the stored punch class. The skeleton cross-check did not agree "
+            "on a majority of classified punches."
+        )
+    notes.append(DecodeNote(field=f"offense.{track.corner}.trajectory", confidence=confidence, note=note))
+    return labels
+
+
+def _hand_labels(track: TrackData, notes: list[DecodeNote]) -> dict[int, str]:
+    """Byte 10 is authoritative: 0 right, 1 left. Skeleton motion only sets confidence."""
+    labels = dict(HAND_LABEL)
+    agreed = 0
+    voted = 0
+    ticks = track.skeleton_ticks
+    pos = track.skeleton_pos
+    if len(pos):
+        for punch in track.punches:
+            if punch.hand_index not in labels or punch.launch_tick > punch.tick:
+                continue
+            lo = int(np.searchsorted(ticks, punch.launch_tick, side="left"))
+            hi = int(np.searchsorted(ticks, punch.tick, side="right"))
+            if hi - lo < 2:
+                continue
+            window = pos[lo:hi]
+            left_motion = float(np.linalg.norm(np.diff(window[:, L_WRIST], axis=0), axis=1).sum())
+            right_motion = float(np.linalg.norm(np.diff(window[:, R_WRIST], axis=0), axis=1).sum())
+            if left_motion == right_motion:
+                continue
+            voted += 1
+            side = "left" if left_motion > right_motion else "right"
+            if side == labels[punch.hand_index]:
+                agreed += 1
+    if voted and agreed * 2 > voted:
+        confidence = "confirmed"
+        note = (
+            "Byte 10 is the hand: 0 is right and 1 is left. "
+            "From launch to end, that wrist moved more than the other on a majority of punches."
+        )
+    else:
+        confidence = "inferred"
+        note = (
+            "Byte 10 is the hand: 0 is right and 1 is left. "
+            "Skeleton wrist motion did not agree on a majority of punches, so the record label is kept."
+        )
+    notes.append(DecodeNote(field=f"offense.{track.corner}.hand", confidence=confidence, note=note))
+    return labels
 
 
 def _note_scored_hits(landed_events: dict[int, list[EventRecord]], totals: dict[int, dict], notes: list[DecodeNote]) -> None:
@@ -629,8 +815,8 @@ def _match_punches(punches: list[PunchRecord], received: list[EventRecord]) -> d
     pairs: list[tuple[int, int, int]] = []
     for event_index, event in enumerate(received):
         for punch_index, punch in enumerate(punches):
-            delta = abs(punch.tick - event.tick)
-            if delta <= HIT_MATCH_TICKS:
+            if punch.launch_tick - HIT_LAUNCH_LEAD <= event.tick <= punch.tick + HIT_END_LAG:
+                delta = abs(event.tick - punch.launch_tick)
                 pairs.append((delta, event_index, punch_index))
     pairs.sort()
     used_events: set[int] = set()
@@ -677,6 +863,7 @@ def _offense(
     pace_sec: float | None = None,
 ) -> OffenseStats:
     defender = session.tracks[_opponent(session, track.corner)]
+    trajectories = _punch_trajectories(track, defender, notes)
     received = landed_events[defender.corner]
     # m_hits on a corner is hits that fighter took. The punch that landed is on the defender's card.
     official = int(totals.get(defender.corner, {}).get("hits", 0))
@@ -692,7 +879,7 @@ def _offense(
         landed = index in matched
         delta = _punishment_delta(defender, punch.tick) if landed else None
         hand = labels.get(punch.hand_index, f"hand_{punch.hand_index}")
-        trajectory = _trajectory(punch.direction)
+        trajectory = trajectories[index]
         row = PunchRow(
             t_sec=_sec(session, punch.tick),
             tick=punch.tick,
@@ -854,14 +1041,21 @@ def _defense(
     under_speed = float(step[speed_mask].mean()) if speed_mask.any() else None
     quiet = ~speed_mask
     quiet_speed = float(step[quiet].mean()) if quiet.any() else None
-    vertical = float(head[:, 1].max() - head[:, 1].min()) if len(head) else None
-    lateral = float(head[:, 2].max() - head[:, 2].min()) if len(head) else None
+    if len(head):
+        vertical = float(head[:, 1].max() - head[:, 1].min())
+        lateral = math.hypot(
+            float(head[:, 0].max() - head[:, 0].min()),
+            float(head[:, 2].max() - head[:, 2].min()),
+        )
+    else:
+        vertical = None
+        lateral = None
     if body["left"] is None or body["right"] is None:
         notes.append(
             DecodeNote(
                 field=f"defense.{track.corner}.guard_up_percent",
                 confidence="unavailable",
-                note="Guard-up needs two skeleton hands on opposite sides of the head, and that split was not found.",
+                note="Guard-up needs skeleton frames for both wrists, and this slice has none.",
             )
         )
         guard_pct = None
@@ -1215,7 +1409,8 @@ def _static_notes() -> list[DecodeNote]:
             note=(
                 "A completed round runs from the warning to just after the end bell. "
                 "The warning and the bell are type-5 events 735 ticks apart, and the end bell is one round-duration later. "
-                "Round stats, charts, and punch times are seconds after that round's bell. Breaks are not included."
+                "Round stats, charts, and punch times are seconds after that round's bell. "
+                "Fight-level offense and defense use those same bell-to-bell windows, so breaks are not included."
             ),
         ),
         DecodeNote(
@@ -1226,7 +1421,7 @@ def _static_notes() -> list[DecodeNote]:
         DecodeNote(
             field="offense.thrown",
             confidence="confirmed",
-            note="Thrown is the number of 140-byte punch records. kinematic_thrown counts records that include a direction and speed block.",
+            note="Thrown is the number of 140-byte punch records. kinematic_thrown counts records whose byte 9 is 0.",
         ),
         DecodeNote(
             field="offense.accuracy",
@@ -1235,8 +1430,12 @@ def _static_notes() -> list[DecodeNote]:
         ),
         DecodeNote(
             field="offense.trajectory",
-            confidence="inferred",
-            note="straight, hook, uppercut, and overhand are classified from the punch direction vector, not from a game enum.",
+            confidence="confirmed",
+            note=(
+                "Byte 32 is the game punch class: 1 jab, 2 cross, 3 left_hook, 4 right_hook, 6 uppercut. "
+                "Class 0 is the wrist's launch-to-peak displacement in the opponent frame "
+                "(forward, up, right), labeled jab, cross, left_hook, right_hook, uppercut, overhand, or unknown."
+            ),
         ),
         DecodeNote(
             field="offense.speed",
@@ -1247,17 +1446,20 @@ def _static_notes() -> list[DecodeNote]:
             field="defense.guard_up_percent",
             confidence="inferred",
             note=(
-                "A frame is guard-up when both lateral hand joints sit at most "
-                f"{GUARD_DY_MAX:.2f} m below the head and within {GUARD_HORIZ_MAX:.2f} m horizontally. "
-                "Under fire is the 0.05 s before through 0.30 s after each opponent punch record."
+                "A frame is guard-up when both glove centers sit at most "
+                f"{GUARD_DY_MAX:.2f} m below head joint {HEAD} and within {GUARD_HORIZ_MAX:.2f} m horizontally. "
+                "A glove center is the wrist extended along the forearm by half of m_scaledHandLength "
+                "(0.095 m when the snapshot omits it). "
+                "Under fire is the 0.05 s before through 0.30 s after each opponent punch record. "
+                "Fight-level guard uses bell-to-bell ticks only."
             ),
         ),
         DecodeNote(
             field="defense.head",
-            confidence="inferred",
+            confidence="confirmed",
             note=(
-                "The head joint is the skeleton point with the highest median height. "
-                f"Position samples are uint16 values scaled across [-10, 10] m. "
+                f"The head is skeleton joint {HEAD}. Position samples are uint16 values scaled across [-10, 10] m. "
+                "head_lateral_range is the horizontal extent, hypot(max(x) - min(x), max(z) - min(z)). "
                 f"Instantaneous speed above {HEAD_SPEED_CAP:.0f} m/s is clipped as a tracking spike."
             ),
         ),
@@ -1268,8 +1470,12 @@ def _static_notes() -> list[DecodeNote]:
         ),
         DecodeNote(
             field="series.guard_brace",
-            confidence="inferred",
-            note="guard_brace, guard_friction, guard_mass, and guard_ladder are the first quantized sample of each named guard channel.",
+            confidence="confirmed",
+            note=(
+                "guard_brace, guard_friction, guard_mass, and guard_ladder are the first sample of each named channel, "
+                "scaled from uint16 by that channel's header min and max. "
+                "On schema 15 those ranges are brace [0, 8], friction [0, 4], mass [0, 8], and ladder [0, 5]."
+            ),
         ),
         DecodeNote(
             field="timeline.exchange",

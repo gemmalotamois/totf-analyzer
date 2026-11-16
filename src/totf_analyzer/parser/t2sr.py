@@ -6,6 +6,7 @@ Fields that are not exact game-struct names are documented at the call site.
 
 from __future__ import annotations
 
+import math
 import struct
 from dataclasses import dataclass
 
@@ -25,13 +26,58 @@ SCORED_HIT_TYPE = 1
 SCORED_HIT_FLAG = 1
 SCORED_HIT_FLAG_OFFSET = 8
 
+# skeleton.bin stores this fixed 21-joint hierarchy. Positions 0..2 of each
+# joint are xyz; 3..5 are compressed rotations and are not read here.
+JOINT_COUNT = 21
+HIPS = 0
+SPINE = 1
+CHEST = 2
+NECK = 3
+HEAD = 4
+L_CLAVICLE = 5
+L_SHOULDER = 6
+L_ELBOW = 7
+L_WRIST = 8
+R_CLAVICLE = 9
+R_SHOULDER = 10
+R_ELBOW = 11
+R_WRIST = 12
+L_HIP = 13
+L_KNEE = 14
+L_ANKLE = 15
+L_TOE = 16
+R_HIP = 17
+R_KNEE = 18
+R_ANKLE = 19
+R_TOE = 20
+
+# punches.bin byte 10. Bone byte 11 is 17 for the left wrist and 18 for the right.
+HAND_LEFT = 1
+HAND_RIGHT = 0
+BONE_LEFT_WRIST = 17
+BONE_RIGHT_WRIST = 18
+HAND_LABEL = {HAND_RIGHT: "right", HAND_LEFT: "left"}
+
+# punches.bin byte 32. Class 0 is unclassified; analytics labels it from the skeleton.
+PUNCH_CLASS_LABEL = {
+    1: "jab",
+    2: "cross",
+    3: "left_hook",
+    4: "right_hook",
+    6: "uppercut",
+}
+
+GUARD_CHANNEL_ORDER = ("brace", "friction", "mass", "ladder")
+
 
 @dataclass(frozen=True)
 class PunchRecord:
     tick: int
+    launch_tick: int
     hand_index: int
+    bone_index: int
     kinematics: bool
-    direction: tuple[float, float, float] | None
+    punch_class: int
     speed: float | None
 
 
@@ -107,24 +153,21 @@ def read_punches(data: bytes) -> list[PunchRecord]:
     for index in range(count):
         rec = data[PUNCH_HEADER + index * PUNCH_RECORD : PUNCH_HEADER + (index + 1) * PUNCH_RECORD]
         tick = _u32(rec, 0)
-        hand_index = rec[10]
+        launch_tick = _u32(rec, 12)
         kinematics = rec[9] == 0
-        direction: tuple[float, float, float] | None = None
         speed: float | None = None
         if kinematics:
-            x, y, z = struct.unpack_from("<fff", rec, 36)
-            mag = (x * x + y * y + z * z) ** 0.5
-            if mag >= 0.25:
-                direction = (x, y, z)
             raw_speed = struct.unpack_from("<f", rec, 80)[0]
             if raw_speed == raw_speed and 0.5 < raw_speed < 30.0:
                 speed = float(raw_speed)
         punches.append(
             PunchRecord(
                 tick=tick,
-                hand_index=int(hand_index),
+                launch_tick=launch_tick,
+                hand_index=int(rec[10]),
+                bone_index=int(rec[11]),
                 kinematics=kinematics,
-                direction=direction,
+                punch_class=int(rec[32]),
                 speed=speed,
             )
         )
@@ -165,17 +208,62 @@ def read_stiffness(data: bytes, origin_tick: int) -> tuple[np.ndarray, np.ndarra
     return ticks, payload
 
 
-def read_guard_channels(data: bytes, origin_tick: int) -> tuple[np.ndarray, np.ndarray]:
-    """Return ticks and the first quantized sample of brace, friction, mass, ladder."""
+def guard_channel_scales(data: bytes) -> dict[str, tuple[float, float]]:
+    """Name to (min, max) for brace, friction, mass, and ladder.
+
+    Each header entry is a uint16 byte-count, the channel name, then float32
+    min and max. The count includes a trailing NUL that is also the first byte
+    of a 0 minimum, so the min float starts on that NUL.
+    """
     assert_t2sr(data, "guard.bin")
-    if b"brace" not in data[:160] or b"friction" not in data[:160]:
-        raise ValueError("guard.bin is missing brace/friction channel names")
+    limit = min(len(data), 200)
+    for start in range(8, limit):
+        parsed = _guard_scale_table(data, start)
+        if parsed is None:
+            continue
+        names = [name for name, _lo, _hi in parsed]
+        if names == list(GUARD_CHANNEL_ORDER):
+            return {name: (lo, hi) for name, lo, hi in parsed}
+    raise ValueError("guard.bin channel scale table was not found")
+
+
+def _guard_scale_table(data: bytes, start: int) -> list[tuple[str, float, float]] | None:
+    parsed: list[tuple[str, float, float]] = []
+    offset = start
+    for _channel in range(len(GUARD_CHANNEL_ORDER)):
+        if offset + 2 > len(data):
+            return None
+        length = struct.unpack_from("<H", data, offset)[0]
+        if not 3 <= length <= 32 or offset + 2 + length + 7 > len(data):
+            return None
+        name = data[offset + 2 : offset + 1 + length]
+        if not name.isascii() or not name.isalpha():
+            return None
+        minimum, maximum = struct.unpack_from("<ff", data, offset + 1 + length)
+        if not (_finite_scale(minimum) and _finite_scale(maximum) and maximum > minimum):
+            return None
+        parsed.append((name.decode("ascii"), float(minimum), float(maximum)))
+        offset = offset + 1 + length + 8
+    return parsed
+
+
+def _finite_scale(value: float) -> bool:
+    return math.isfinite(value) and abs(value) < 1.0e6
+
+
+def read_guard_channels(data: bytes, origin_tick: int) -> tuple[np.ndarray, np.ndarray]:
+    """Return ticks and the first sample of brace, friction, mass, ladder in header units."""
+    scales = guard_channel_scales(data)
     start = find_record_start(data, stride=52, tick_step=1, origin_tick=origin_tick)
-    ticks, samples = read_tick_stream(data, start, 52, "<i2", 24)
-    # Four named channels, six int16 samples each. The first sample is the
+    ticks, samples = read_tick_stream(data, start, 52, "<u2", 24)
+    # Four named channels, six uint16 samples each. The first sample is the
     # channel's primary level; the rest of the group is not independently named.
-    primary = samples.reshape(len(ticks), 4, 6)[:, :, 0].astype(np.float32)
-    return ticks, primary
+    primary = samples.reshape(len(ticks), 4, 6)[:, :, 0].astype(np.float64)
+    scaled = np.empty_like(primary)
+    for index, name in enumerate(GUARD_CHANNEL_ORDER):
+        lower, upper = scales[name]
+        scaled[:, index] = lower + (primary[:, index] / 65535.0) * (upper - lower)
+    return ticks, scaled.astype(np.float32)
 
 
 def read_skeleton_positions(data: bytes, origin_tick: int) -> tuple[np.ndarray, np.ndarray]:
