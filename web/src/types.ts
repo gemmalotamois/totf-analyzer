@@ -142,6 +142,18 @@ export type FightAnalytics = {
       lead_left_percent: number | null;
       square_while_punching_percent: number | null;
     };
+    head_movement: {
+      head_lateral_slip_m: { median: number | null; p90: number | null; under_fire_p90: number | null };
+      off_centerline_percent: number | null;
+      off_centerline_under_fire_percent: number | null;
+      off_centerline_while_punching_percent: number | null;
+      head_height_iqr_m: number | null;
+      p05_p95_span_m: number | null;
+      pelvis_drop_iqr_m: number | null;
+      trunk_bend_iqr_m: number | null;
+      duck_count: number;
+      bob_and_weave_count: number;
+    };
   }[];
   key_moments: {
     t_sec: number;

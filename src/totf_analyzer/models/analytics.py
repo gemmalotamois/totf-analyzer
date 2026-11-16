@@ -159,6 +159,25 @@ class DistanceSpread(BaseModel):
     p90: float | None = None
 
 
+class SlipSpread(BaseModel):
+    median: float | None = None
+    p90: float | None = None
+    under_fire_p90: float | None = None
+
+
+class HeadMovementStats(BaseModel):
+    head_lateral_slip_m: SlipSpread = Field(default_factory=SlipSpread)
+    off_centerline_percent: float | None = None
+    off_centerline_under_fire_percent: float | None = None
+    off_centerline_while_punching_percent: float | None = None
+    head_height_iqr_m: float | None = None
+    p05_p95_span_m: float | None = None
+    pelvis_drop_iqr_m: float | None = None
+    trunk_bend_iqr_m: float | None = None
+    duck_count: int = 0
+    bob_and_weave_count: int = 0
+
+
 class FootworkStats(BaseModel):
     total_distance_m: float | None = None
     radial_distance_m: float | None = None
@@ -231,6 +250,7 @@ class DefenseStats(BaseModel):
     received_damage_official: float
     guard_discipline: GuardDisciplineStats = Field(default_factory=GuardDisciplineStats)
     footwork: FootworkStats = Field(default_factory=FootworkStats)
+    head_movement: HeadMovementStats = Field(default_factory=HeadMovementStats)
 
 
 class KeyMoment(BaseModel):
