@@ -93,14 +93,18 @@ def test_cross_stream_metrics(report):
     red_hands = {row.hand: row for row in by_corner[1].hands}
     assert sum(row.landed for row in by_corner[1].hands) == 33
     assert sum(row.thrown for row in by_corner[1].hands) == 110
-    assert set(red_hands) >= {"hand_0", "hand_1"} or set(red_hands) >= {"left", "right"}
+    assert {"left", "right"} <= set(red_hands)
+    assert "hand_0" not in red_hands and "hand_1" not in red_hands
     assert by_corner[1].kinematic_thrown == 61
     assert by_corner[1].velocity.samples == 61
     assert by_corner[1].velocity.mean_thrown is not None
     assert by_corner[2].velocity.samples == 0
-    trajectories = {row.trajectory for row in by_corner[1].trajectories}
-    assert "straight" in trajectories
-    assert "unknown" in {row.trajectory for row in by_corner[2].trajectories}
+    trajectories = {row.trajectory: row for row in by_corner[1].trajectories}
+    assert {"jab", "cross", "left_hook", "right_hook"} <= set(trajectories)
+    assert trajectories["left_hook"].thrown >= 9
+    assert trajectories["right_hook"].thrown >= 22
+    assert trajectories["jab"].thrown >= 16
+    assert trajectories["cross"].thrown >= 9
 
     defense = {item.corner: item for item in report.defense}
     for corner in (1, 2):

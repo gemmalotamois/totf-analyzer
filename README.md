@@ -69,12 +69,13 @@ Tools:
 | Thrown | Punch records in `punches.bin` |
 | Landed | Type-1 events on the defender's track with flag byte 8 set. That count is the defender's official hits taken, and the attacker's landed punches. |
 | Accuracy | Landed / thrown |
-| Hand | Record byte 10 (`hand_0` / `hand_1`). Left/right is applied only when skeleton motion agrees. |
-| Trajectory | `straight`, `hook`, `uppercut`, `overhand`, or `unknown`, from the direction vector when the kinematics block is present |
+| Hand | Record byte 10: `0` right, `1` left. Confirmed when that wrist moves more than the other from launch to end. |
+| Trajectory | Byte 32: `1` jab, `2` cross, `3` left_hook, `4` right_hook, `6` uppercut. Class `0` is the wrist's launch-to-peak displacement in the opponent frame (forward, up, right). |
 | Speed | Float at punch-record offset 80, treated as m/s |
-| Guard up | Both lateral hand joints within 0.38 m below the head and 0.40 m horizontally |
+| Guard up | Both glove centers within 0.38 m below head joint 4 and 0.40 m horizontally. A glove center is the wrist extended along the forearm by half of `m_scaledHandLength` (0.095 m if the snapshot omits it). Fight-level percent uses bell-to-bell ticks only. |
 | Under fire | 0.05 s before through 0.30 s after each opponent punch record |
-| Head | Skeleton joint with the highest median height |
+| Head | Skeleton joint 4. `head_lateral_range` is the horizontal extent, hypot(max x − min x, max z − min z). |
+| Guard channels | `guard_brace`, `guard_friction`, `guard_mass`, and `guard_ladder` are uint16 samples scaled by the header min/max. Schema 15 ranges are brace [0, 8], friction [0, 4], mass [0, 8], ladder [0, 5]. |
 | Punishment | Three float meters in `punishment.bin`, separate from official received damage |
 | Exchange | A run of 1-second bins where each fighter has at least 2 punch records |
 | Stun / knockdown / knockout | Event type codes whose counts match that corner's scorecard totals |
