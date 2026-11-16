@@ -50,10 +50,15 @@ def _cmd_analyze(args: argparse.Namespace) -> None:
     )
     for offense in payload["offense"]:
         defense = next(item for item in payload["defense"] if item["corner"] == offense["corner"])
+        discipline = defense["guard_discipline"]
         print(
             f"corner {offense['corner']}: thrown {offense['thrown']}  landed {offense['landed']}"
             f"  official {offense['official_hits']}  accuracy {offense['accuracy']}"
             f"  guard_up {defense['guard_up_percent']}  guard_up_under_fire {defense['guard_up_percent_under_fire']}"
+        )
+        print(
+            f"  offhand_kept {discipline['offhand_guard_kept_percent']}"
+            f"  retraction_returned {discipline['retraction_returned_percent']}"
         )
     for rnd in payload["rounds"]:
         if not rnd["completed"] or not rnd["offense"]:

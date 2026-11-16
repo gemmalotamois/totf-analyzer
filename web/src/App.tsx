@@ -452,6 +452,8 @@ function RoundSection({
   const blueOff = round.offense.find((item) => item.corner === blue?.corner);
   const redDef = round.defense.find((item) => item.corner === red?.corner);
   const blueDef = round.defense.find((item) => item.corner === blue?.corner);
+  const redGuard = redDef?.guard_discipline;
+  const blueGuard = blueDef?.guard_discipline;
   const ending = roundEnding(round);
   const hands = handChart(round.offense);
   const punishment = seriesPoints(round.series, "punishment_0");
@@ -504,6 +506,15 @@ function RoundSection({
               <Row label="Knockdowns" red={round.red.all_knockdowns} blue={round.blue.all_knockdowns} />
               <Row label="Guard up" red={num(redDef?.guard_up_percent ?? null)} blue={num(blueDef?.guard_up_percent ?? null)} suffix="%" />
               <Row label="Guard up under fire" red={num(redDef?.guard_up_percent_under_fire ?? null)} blue={num(blueDef?.guard_up_percent_under_fire ?? null)} suffix="%" />
+              <Row label="Left glove up" red={num(redGuard?.left_guard_up_percent ?? null)} blue={num(blueGuard?.left_guard_up_percent ?? null)} suffix="%" />
+              <Row label="Right glove up" red={num(redGuard?.right_guard_up_percent ?? null)} blue={num(blueGuard?.right_guard_up_percent ?? null)} suffix="%" />
+              <Row label="Either glove up" red={num(redGuard?.either_guard_up_percent ?? null)} blue={num(blueGuard?.either_guard_up_percent ?? null)} suffix="%" />
+              <Row label="Off-hand kept" red={num(redGuard?.offhand_guard_kept_percent ?? null)} blue={num(blueGuard?.offhand_guard_kept_percent ?? null)} suffix="%" />
+              <Row label="Off-hand kept, throwing left" red={num(redGuard?.offhand_guard_kept_percent_throwing_left ?? null)} blue={num(blueGuard?.offhand_guard_kept_percent_throwing_left ?? null)} suffix="%" />
+              <Row label="Off-hand kept, throwing right" red={num(redGuard?.offhand_guard_kept_percent_throwing_right ?? null)} blue={num(blueGuard?.offhand_guard_kept_percent_throwing_right ?? null)} suffix="%" />
+              <Row label="Hand returned" red={num(redGuard?.retraction_returned_percent ?? null)} blue={num(blueGuard?.retraction_returned_percent ?? null)} suffix="%" />
+              <Row label="Return time, median" red={num(redGuard?.retraction_time_ms.median ?? null, 0)} blue={num(blueGuard?.retraction_time_ms.median ?? null, 0)} suffix=" ms" />
+              <Row label="Return droop, median" red={num(redGuard?.retraction_droop_m.median ?? null, 2)} blue={num(blueGuard?.retraction_droop_m.median ?? null, 2)} suffix=" m" />
               <Row label="Under fire" red={num(redDef?.under_fire_seconds ?? null)} blue={num(blueDef?.under_fire_seconds ?? null)} suffix=" s" />
               <Row label="Head speed" red={num(redDef?.head_mean_speed ?? null, 2)} blue={num(blueDef?.head_mean_speed ?? null, 2)} />
               <Row label="Head speed under fire" red={num(redDef?.head_mean_speed_under_fire ?? null, 2)} blue={num(blueDef?.head_mean_speed_under_fire ?? null, 2)} />

@@ -81,6 +81,12 @@ export type FightAnalytics = {
       speed: number | null;
       landed: boolean;
       punishment_delta: number | null;
+      offhand_in_guard: boolean | null;
+      offhand_drop_m: number | null;
+      offhand_flare_m: number | null;
+      retraction_ms: number | null;
+      retraction_droop_m: number | null;
+      retraction_directness: number | null;
     }[];
   }[];
   defense: {
@@ -95,6 +101,27 @@ export type FightAnalytics = {
     head_lateral_range: number | null;
     punishment_peak: number[];
     received_damage_official: number;
+    guard_discipline: {
+      left_guard_up_percent: number | null;
+      right_guard_up_percent: number | null;
+      both_guard_up_percent: number | null;
+      either_guard_up_percent: number | null;
+      left_guard_up_percent_under_fire: number | null;
+      right_guard_up_percent_under_fire: number | null;
+      both_guard_up_percent_under_fire: number | null;
+      either_guard_up_percent_under_fire: number | null;
+      offhand_guard_kept_percent: number | null;
+      offhand_guard_kept_percent_throwing_left: number | null;
+      offhand_guard_kept_percent_throwing_right: number | null;
+      offhand_drop_below_head_m_lead: { median: number | null; p90: number | null };
+      offhand_drop_below_head_m_rear: { median: number | null; p90: number | null };
+      offhand_lateral_flare_m_lead: { median: number | null; p90: number | null };
+      offhand_lateral_flare_m_rear: { median: number | null; p90: number | null };
+      retraction_returned_percent: number | null;
+      retraction_time_ms: { median: number | null; mean: number | null; p90: number | null };
+      retraction_droop_m: { median: number | null; p90: number | null; sag_over_10cm_percent: number | null };
+      retraction_directness_ratio: { median: number | null; mean: number | null };
+    };
   }[];
   key_moments: {
     t_sec: number;
