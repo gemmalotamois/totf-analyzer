@@ -152,6 +152,34 @@ class DirectnessRatio(BaseModel):
     mean: float | None = None
 
 
+class DistanceSpread(BaseModel):
+    mean: float | None = None
+    p10: float | None = None
+    median: float | None = None
+    p90: float | None = None
+
+
+class FootworkStats(BaseModel):
+    total_distance_m: float | None = None
+    radial_distance_m: float | None = None
+    tangential_distance_m: float | None = None
+    tangential_share: float | None = None
+    clockwise_distance_m: float | None = None
+    counterclockwise_distance_m: float | None = None
+    angle_cut_count: int = 0
+    attack_entry_angle_deg: float | None = None
+    post_combo_exit_angle_deg: float | None = None
+    fighter_distance_m: DistanceSpread = Field(default_factory=DistanceSpread)
+    clinch_range_percent: float | None = None
+    pocket_range_percent: float | None = None
+    outside_range_percent: float | None = None
+    shoulder_blade_angle_deg: float | None = None
+    foot_blade_angle_deg: float | None = None
+    square_stance_percent: float | None = None
+    lead_left_percent: float | None = None
+    square_while_punching_percent: float | None = None
+
+
 class GuardDisciplineStats(BaseModel):
     left_guard_up_percent: float | None = None
     right_guard_up_percent: float | None = None
@@ -202,6 +230,7 @@ class DefenseStats(BaseModel):
     punishment_peak: list[float] = Field(default_factory=list)
     received_damage_official: float
     guard_discipline: GuardDisciplineStats = Field(default_factory=GuardDisciplineStats)
+    footwork: FootworkStats = Field(default_factory=FootworkStats)
 
 
 class KeyMoment(BaseModel):

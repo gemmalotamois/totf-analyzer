@@ -122,6 +122,26 @@ export type FightAnalytics = {
       retraction_droop_m: { median: number | null; p90: number | null; sag_over_10cm_percent: number | null };
       retraction_directness_ratio: { median: number | null; mean: number | null };
     };
+    footwork: {
+      total_distance_m: number | null;
+      radial_distance_m: number | null;
+      tangential_distance_m: number | null;
+      tangential_share: number | null;
+      clockwise_distance_m: number | null;
+      counterclockwise_distance_m: number | null;
+      angle_cut_count: number;
+      attack_entry_angle_deg: number | null;
+      post_combo_exit_angle_deg: number | null;
+      fighter_distance_m: { mean: number | null; p10: number | null; median: number | null; p90: number | null };
+      clinch_range_percent: number | null;
+      pocket_range_percent: number | null;
+      outside_range_percent: number | null;
+      shoulder_blade_angle_deg: number | null;
+      foot_blade_angle_deg: number | null;
+      square_stance_percent: number | null;
+      lead_left_percent: number | null;
+      square_while_punching_percent: number | null;
+    };
   }[];
   key_moments: {
     t_sec: number;
