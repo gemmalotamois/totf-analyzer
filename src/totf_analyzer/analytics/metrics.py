@@ -13,8 +13,10 @@ from totf_analyzer.models.analytics import (
     DecodeNote,
     DefenseStats,
     DirectnessRatio,
+    DistanceSpread,
     FightAnalytics,
     Fighter,
+    FootworkStats,
     GuardDisciplineStats,
     HandStats,
     HistogramBin,
@@ -35,10 +37,14 @@ from totf_analyzer.parser.t2sr import (
     HAND_LABEL,
     HEAD,
     HIPS,
+    L_ANKLE,
     L_ELBOW,
+    L_SHOULDER,
     L_WRIST,
     PUNCH_CLASS_LABEL,
+    R_ANKLE,
     R_ELBOW,
+    R_SHOULDER,
     R_WRIST,
     EventRecord,
     PunchRecord,
@@ -79,6 +85,17 @@ ROUND_START_GAP = 735
 END_BELL_TOLERANCE = 12
 # Punches that land just after the bell still belong to the round.
 BELL_GRACE_TICKS = 240
+# Footwork uses the official bell span, not the warning or the post-bell grace.
+CLINCH_RANGE_M = 0.85
+POCKET_RANGE_M = 1.35
+SQUARE_BLADE_DEG = 15.0
+ANGLE_CUT_DEG = 20.0
+ANGLE_CUT_SEC = 0.75
+ANGLE_CUT_RANGE_M = 1.8
+COMBO_GAP_SEC = 0.65
+COMBO_EXIT_SEC = 0.5
+MIN_RANGE_M = 1.0e-3
+MIN_LINE_M = 1.0e-4
 
 # Event type codes whose counts line up with scorecard totals on schema 15.
 COUNT_MATCHED_EVENTS = (
@@ -99,7 +116,13 @@ def build_analytics(session: ParsedSession) -> FightAnalytics:
     active = _within_windows(session, windows)
     pace = sum(window.duration_sec for window in windows) if windows else None
     offense, defense, moments, series = _measure(
-        active, labels, totals, notes, pace_sec=pace, clock_ticks=_clock_ticks(windows)
+        active,
+        labels,
+        totals,
+        notes,
+        pace_sec=pace,
+        clock_ticks=_clock_ticks(windows),
+        windows=windows,
     )
     _attach_rounds(session, rounds, labels, windows)
     notes.extend(_static_notes())
@@ -122,6 +145,7 @@ def _measure(
     notes: list[DecodeNote],
     pace_sec: float | None = None,
     clock_ticks: set[int] | None = None,
+    windows: list[_RoundWindow] | None = None,
 ) -> tuple[list[OffenseStats], list[DefenseStats], list[KeyMoment], list[Series]]:
     bodies = {corner: _body(track) for corner, track in session.tracks.items()}
     landed_events = {
@@ -151,14 +175,30 @@ def _measure(
         )
         for track in _ordered(session)
     ]
+    spans = _bell_spans(windows or [])
+    footwork: dict[int, tuple[FootworkStats, list[_AngleCut]]] = {
+        track.corner: _footwork(track, session.tracks[_opponent(session, track.corner)], spans, session.fixed_timestep)
+        for track in _ordered(session)
+    }
     defense = [
-        _defense(session, track, bodies[track.corner], totals, notes, punch_guards[track.corner])
+        _defense(
+            session,
+            track,
+            bodies[track.corner],
+            totals,
+            notes,
+            punch_guards[track.corner],
+            footwork[track.corner][0],
+        )
         for track in _ordered(session)
     ]
+    moments = _key_moments(session, matches, bodies, totals, notes, clock_ticks)
+    moments.extend(_angle_cut_moments(session, {corner: cuts for corner, (_stats, cuts) in footwork.items()}))
+    moments.sort(key=lambda item: (item.t_sec, item.type))
     return (
         offense,
         defense,
-        _key_moments(session, matches, bodies, totals, notes, clock_ticks),
+        moments,
         _series(session, bodies),
     )
 
@@ -535,6 +575,7 @@ def _attach_rounds(
             _score_totals([rnd]),
             [],
             pace_sec=window.duration_sec,
+            windows=[window],
         )
         rnd.bell_sec = window.bell_sec
         rnd.end_sec = window.end_sec
@@ -632,6 +673,13 @@ def _body(track: TrackData) -> dict:
     }
 
 
+def _nearest_index(source_ticks: np.ndarray, query_ticks: np.ndarray) -> np.ndarray:
+    nearest = np.clip(np.searchsorted(source_ticks, query_ticks, side="left"), 0, len(source_ticks) - 1)
+    previous = np.clip(nearest - 1, 0, len(source_ticks) - 1)
+    nearer_previous = np.abs(source_ticks[previous] - query_ticks) < np.abs(source_ticks[nearest] - query_ticks)
+    return np.where(nearer_previous, previous, nearest)
+
+
 def _local_axes(track: TrackData, opponent: TrackData) -> tuple[np.ndarray, np.ndarray]:
     """Per skeleton frame: horizontal forward toward the opponent, and the fighter's right."""
     ticks = track.skeleton_ticks.astype(np.int64)
@@ -641,11 +689,7 @@ def _local_axes(track: TrackData, opponent: TrackData) -> tuple[np.ndarray, np.n
         forward[:, 2] = 1.0
         right = np.stack([forward[:, 2], np.zeros(count), -forward[:, 0]], axis=1)
         return forward, right
-    opp_ticks = opponent.skeleton_ticks.astype(np.int64)
-    nearest = np.clip(np.searchsorted(opp_ticks, ticks, side="left"), 0, len(opp_ticks) - 1)
-    previous = np.clip(nearest - 1, 0, len(opp_ticks) - 1)
-    nearer_previous = np.abs(opp_ticks[previous] - ticks) < np.abs(opp_ticks[nearest] - ticks)
-    nearest = np.where(nearer_previous, previous, nearest)
+    nearest = _nearest_index(opponent.skeleton_ticks.astype(np.int64), ticks)
     opp = opponent.skeleton_pos[nearest].astype(np.float64)
     mine = track.skeleton_pos.astype(np.float64)
     delta = opp[:, HIPS] - mine[:, HIPS]
@@ -1322,6 +1366,256 @@ def _guard_discipline(
     )
 
 
+@dataclass(frozen=True)
+class _AngleCut:
+    tick: int
+    delta_deg: float
+    duration_sec: float
+    direction: str
+
+
+def _bell_spans(windows: list[_RoundWindow]) -> list[tuple[int, int]]:
+    spans: list[tuple[int, int]] = []
+    for window in windows:
+        end = window.end_bell_tick if window.end_bell_tick is not None else window.stats_end
+        if end >= window.bell_tick:
+            spans.append((window.bell_tick, end))
+    return spans
+
+
+def _empty_footwork() -> FootworkStats:
+    return FootworkStats()
+
+
+def _rolling_sum(values: np.ndarray, width: int) -> np.ndarray:
+    if width <= 0 or len(values) < width:
+        return np.zeros(0, dtype=np.float64)
+    cumulative = np.cumsum(values)
+    total = cumulative[width - 1 :].copy()
+    total[1:] -= cumulative[: len(total) - 1]
+    return total
+
+
+def _fold_blade(forward_comp: np.ndarray, tangent_comp: np.ndarray) -> np.ndarray:
+    """Signed angle of a joint line against the fighter's right, folded into [-90, 90]."""
+    angle = np.degrees(np.arctan2(forward_comp, -tangent_comp))
+    angle = np.where(angle > 90.0, angle - 180.0, angle)
+    return np.where(angle < -90.0, angle + 180.0, angle)
+
+
+def _line_angle(pos: np.ndarray, left: int, right: int, forward: np.ndarray, sideways: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    line = pos[:, left] - pos[:, right]
+    line[:, 1] = 0.0
+    length = np.linalg.norm(line, axis=1)
+    signed = _fold_blade(np.sum(line * forward, axis=1), np.sum(line * sideways, axis=1))
+    return signed, length >= MIN_LINE_M
+
+
+def _sum_sweep(ticks: np.ndarray, sweep: np.ndarray, valid: np.ndarray, start: int, stop: int) -> float:
+    if stop <= start or len(sweep) == 0:
+        return 0.0
+    origins = ticks[:-1]
+    selected = valid & (origins >= start) & (origins < stop)
+    if not np.any(selected):
+        return 0.0
+    return float(sweep[selected].sum())
+
+
+def _angle_cuts(
+    ticks: np.ndarray,
+    distance: np.ndarray,
+    sweep: np.ndarray,
+    in_bell: np.ndarray,
+    step_valid: np.ndarray,
+    timestep: float,
+) -> list[_AngleCut]:
+    span = int(round(ANGLE_CUT_SEC / timestep))
+    count = len(ticks)
+    if span <= 0 or count <= span:
+        return []
+    frame_ok = _rolling_sum(in_bell.astype(np.float64), span + 1) == span + 1
+    steps_ok = _rolling_sum(step_valid.astype(np.float64), span) == span
+    window = np.lib.stride_tricks.sliding_window_view(distance, span + 1)
+    near = window.max(axis=1) < ANGLE_CUT_RANGE_M
+    turned = _rolling_sum(sweep, span)
+    width = min(len(frame_ok), len(steps_ok), len(near), len(turned))
+    if width <= 0:
+        return []
+    qualifying = np.flatnonzero(frame_ok[:width] & steps_ok[:width] & near[:width] & (np.abs(turned[:width]) >= ANGLE_CUT_DEG))
+    if len(qualifying) == 0:
+        return []
+    groups: list[list[int]] = [[int(qualifying[0])]]
+    for start in qualifying[1:]:
+        if int(start) <= groups[-1][-1] + span:
+            groups[-1].append(int(start))
+        else:
+            groups.append([int(start)])
+    cuts: list[_AngleCut] = []
+    for group in groups:
+        last = group[-1] + span
+        delta = float(sweep[group[0] : last].sum())
+        peak = group[int(np.argmax(np.abs(turned[group])))]
+        cuts.append(
+            _AngleCut(
+                tick=int(ticks[peak]),
+                delta_deg=delta,
+                duration_sec=(last - group[0]) * timestep,
+                direction="counterclockwise" if delta >= 0.0 else "clockwise",
+            )
+        )
+    return cuts
+
+
+def _combo_angles(
+    track: TrackData,
+    ticks: np.ndarray,
+    sweep: np.ndarray,
+    valid: np.ndarray,
+    spans: list[tuple[int, int]],
+    timestep: float,
+    covered: bool,
+) -> tuple[float | None, float | None]:
+    exit_ticks = int(round(COMBO_EXIT_SEC / timestep))
+    chosen: list[tuple[PunchRecord, tuple[int, int]]] = []
+    for punch in track.punches:
+        span = next((item for item in spans if item[0] <= punch.launch_tick <= item[1]), None)
+        if span is not None:
+            chosen.append((punch, span))
+    chosen.sort(key=lambda item: (item[0].launch_tick, item[0].tick))
+    if not chosen or not covered:
+        return None, None
+    groups: list[list[tuple[PunchRecord, tuple[int, int]]]] = []
+    for item in chosen:
+        punch, _span = item
+        if groups and (punch.launch_tick - groups[-1][-1][0].launch_tick) * timestep > COMBO_GAP_SEC:
+            groups.append([item])
+        elif not groups:
+            groups.append([item])
+        else:
+            groups[-1].append(item)
+    entries: list[float] = []
+    exits: list[float] = []
+    for group in groups:
+        first, span = group[0]
+        last = group[-1][0]
+        entries.append(_sum_sweep(ticks, sweep, valid, first.launch_tick, min(last.tick, span[1])))
+        exits.append(_sum_sweep(ticks, sweep, valid, last.tick, min(last.tick + exit_ticks, span[1])))
+    return float(np.mean(entries)), float(np.mean(exits))
+
+
+def _footwork(
+    track: TrackData,
+    opponent: TrackData,
+    spans: list[tuple[int, int]],
+    timestep: float,
+) -> tuple[FootworkStats, list[_AngleCut]]:
+    """Hips path, range, stance, and angle cuts on bell-to-end-bell frames."""
+    ticks = track.skeleton_ticks.astype(np.int64)
+    if len(ticks) == 0 or not spans or len(opponent.skeleton_ticks) == 0 or timestep <= 0:
+        return _empty_footwork(), []
+    forward, right = _local_axes(track, opponent)
+    pos = track.skeleton_pos.astype(np.float64)
+    nearest = _nearest_index(opponent.skeleton_ticks.astype(np.int64), ticks)
+    delta = opponent.skeleton_pos[nearest, HIPS].astype(np.float64) - pos[:, HIPS]
+    delta[:, 1] = 0.0
+    distance = np.linalg.norm(delta, axis=1)
+    in_bell = np.zeros(len(ticks), dtype=bool)
+    for start, stop in spans:
+        in_bell |= (ticks >= start) & (ticks <= stop)
+    step = np.diff(pos[:, HIPS], axis=0)
+    step[:, 1] = 0.0
+    step_valid = np.diff(ticks) == 1
+    radial_step = np.sum(step * forward[:-1], axis=1)
+    tangent_step = np.sum(step * right[:-1], axis=1)
+    distance_at_start = distance[:-1]
+    sweep = np.zeros(len(tangent_step), dtype=np.float64)
+    measurable = step_valid & (distance_at_start >= MIN_RANGE_M)
+    sweep[measurable] = np.degrees(tangent_step[measurable] / distance_at_start[measurable])
+    counted = step_valid & in_bell[:-1]
+    radial = float(np.abs(radial_step[counted]).sum()) if np.any(counted) else 0.0
+    clockwise = float(np.abs(tangent_step[counted & (tangent_step < 0.0)]).sum()) if np.any(counted) else 0.0
+    counterclockwise = float(tangent_step[counted & (tangent_step > 0.0)].sum()) if np.any(counted) else 0.0
+    tangential = clockwise + counterclockwise
+    total = radial + tangential
+    samples = distance[in_bell]
+    shoulder, shoulder_ok = _line_angle(pos, L_SHOULDER, R_SHOULDER, forward, right)
+    foot_line, foot_ok = _line_angle(pos, L_ANKLE, R_ANKLE, forward, right)
+    shoulder_samples = shoulder[in_bell & shoulder_ok]
+    foot_samples = foot_line[in_bell & foot_ok]
+    launch_angles: list[float] = []
+    bell_index = {int(tick): index for index, tick in enumerate(ticks) if in_bell[index]}
+    for punch in track.punches:
+        if not any(start <= punch.launch_tick <= stop for start, stop in spans):
+            continue
+        index = bell_index.get(punch.launch_tick)
+        if index is None or not shoulder_ok[index]:
+            continue
+        launch_angles.append(float(shoulder[index]))
+    cuts = _angle_cuts(ticks, distance, sweep, in_bell, step_valid, timestep)
+    entry, exit_angle = _combo_angles(track, ticks, sweep, measurable & in_bell[:-1], spans, timestep, bool(np.any(in_bell)))
+    square_while = None
+    if launch_angles:
+        square_while = 100.0 * sum(abs(angle) < SQUARE_BLADE_DEG for angle in launch_angles) / len(launch_angles)
+    stats = FootworkStats(
+        total_distance_m=_finite(total) if len(samples) else None,
+        radial_distance_m=_finite(radial) if len(samples) else None,
+        tangential_distance_m=_finite(tangential) if len(samples) else None,
+        tangential_share=_finite(tangential / total) if total > 0.0 else None,
+        clockwise_distance_m=_finite(clockwise) if len(samples) else None,
+        counterclockwise_distance_m=_finite(counterclockwise) if len(samples) else None,
+        angle_cut_count=len(cuts),
+        attack_entry_angle_deg=_finite(entry),
+        post_combo_exit_angle_deg=_finite(exit_angle),
+        fighter_distance_m=_distance_spread(samples),
+        clinch_range_percent=_finite(float(np.mean(samples < CLINCH_RANGE_M) * 100.0)) if len(samples) else None,
+        pocket_range_percent=_finite(float(np.mean((samples >= CLINCH_RANGE_M) & (samples <= POCKET_RANGE_M)) * 100.0))
+        if len(samples)
+        else None,
+        outside_range_percent=_finite(float(np.mean(samples > POCKET_RANGE_M) * 100.0)) if len(samples) else None,
+        shoulder_blade_angle_deg=_finite(float(np.percentile(np.abs(shoulder_samples), 50))) if len(shoulder_samples) else None,
+        foot_blade_angle_deg=_finite(float(np.percentile(np.abs(foot_samples), 50))) if len(foot_samples) else None,
+        square_stance_percent=_finite(float(np.mean(np.abs(shoulder_samples) < SQUARE_BLADE_DEG) * 100.0))
+        if len(shoulder_samples)
+        else None,
+        lead_left_percent=_finite(float(np.mean(shoulder_samples >= SQUARE_BLADE_DEG) * 100.0))
+        if len(shoulder_samples)
+        else None,
+        square_while_punching_percent=_finite(square_while),
+    )
+    return stats, cuts
+
+
+def _distance_spread(samples: np.ndarray) -> DistanceSpread:
+    if len(samples) == 0:
+        return DistanceSpread()
+    return DistanceSpread(
+        mean=_finite(float(samples.mean())),
+        p10=_finite(float(np.percentile(samples, 10))),
+        median=_finite(float(np.percentile(samples, 50))),
+        p90=_finite(float(np.percentile(samples, 90))),
+    )
+
+
+def _angle_cut_moments(session: ParsedSession, cuts: dict[int, list[_AngleCut]]) -> list[KeyMoment]:
+    moments: list[KeyMoment] = []
+    for corner, bursts in cuts.items():
+        for burst in bursts:
+            moments.append(
+                KeyMoment(
+                    t_sec=_sec(session, burst.tick),
+                    tick=burst.tick,
+                    type="angle_cut",
+                    corners=[corner],
+                    detail={
+                        "delta_deg": round(burst.delta_deg, 4),
+                        "duration_sec": round(burst.duration_sec, 4),
+                        "direction": burst.direction,
+                    },
+                )
+            )
+    return moments
+
+
 def _defense(
     session: ParsedSession,
     track: TrackData,
@@ -1329,6 +1623,7 @@ def _defense(
     totals: dict[int, dict],
     notes: list[DecodeNote],
     punch_guards: list[_PunchGuard],
+    footwork: FootworkStats,
 ) -> DefenseStats:
     mask = _under_fire_mask(session, track, body)
     guard = body["guard"]
@@ -1380,6 +1675,7 @@ def _defense(
         punishment_peak=peaks,
         received_damage_official=float(totals.get(track.corner, {}).get("received_damage", 0.0)),
         guard_discipline=_guard_discipline(body, mask, punch_guards, track.stance, track.corner, notes),
+        footwork=footwork,
     )
 
 
@@ -1777,6 +2073,38 @@ def _static_notes() -> list[DecodeNote]:
             ),
         ),
         DecodeNote(
+            field="defense.footwork",
+            confidence="inferred",
+            note=(
+                "Footwork uses hips joint 0 from each round's bell through the end bell. "
+                "The warning and the time after the end bell are left out, and steps are not taken across the break. "
+                "Forward is the horizontal unit from this fighter's hips to the opponent's hips. "
+                "Right is (forward_z, 0, -forward_x), the fighter's right. "
+                "Radial and tangential distances sum the absolute hips steps on those axes. "
+                "total_distance_m is that sum, not the Euclidean path, and tangential_share is tangential divided by it. "
+                "A positive tangential step is counterclockwise around the opponent when viewed from above. "
+                f"Clinch is under {CLINCH_RANGE_M:.2f} m, pocket is {CLINCH_RANGE_M:.2f} m through {POCKET_RANGE_M:.2f} m, "
+                f"and outside is beyond {POCKET_RANGE_M:.2f} m. "
+                "Shoulder blade uses joints 6 and 10. Foot blade uses joints 15 and 19. "
+                "Each reported angle is the median absolute angle of that horizontal line against the fighter's right, "
+                "from 0 (square to the opponent) to 90 (the line points at the opponent). "
+                f"Square stance is a signed shoulder angle under {SQUARE_BLADE_DEG:.0f} degrees. "
+                f"Lead left is a signed shoulder angle of at least {SQUARE_BLADE_DEG:.0f} degrees, left shoulder closer to the opponent. "
+                "Square while punching applies that shoulder test at the launch tick of each punch inside the bell span. "
+                f"An angle cut merges overlapping {ANGLE_CUT_SEC:.2f} s windows in which this fighter's own hips "
+                f"sweep at least {ANGLE_CUT_DEG:.0f} degrees around the opponent while hips distance stays under {ANGLE_CUT_RANGE_M:.1f} m. "
+                "Opponent motion is not added. "
+                f"Entry and exit use the same sweep. Punches whose launch ticks fall more than {COMBO_GAP_SEC:.2f} s apart "
+                f"start a new group. Entry runs from the first launch to the last punch's end tick. "
+                f"Exit is the next {COMBO_EXIT_SEC:.1f} s, stopping at the end bell."
+            ),
+        ),
+        DecodeNote(
+            field="defense.footwork.foot_blade_angle_deg",
+            confidence="inferred",
+            note="Ankle joints are IK-estimated on Quest, so the foot blade angle is not an optical measurement.",
+        ),
+        DecodeNote(
             field="defense.head",
             confidence="confirmed",
             note=(
@@ -1797,6 +2125,16 @@ def _static_notes() -> list[DecodeNote]:
                 "guard_brace, guard_friction, guard_mass, and guard_ladder are the first sample of each named channel, "
                 "scaled from uint16 by that channel's header min and max. "
                 "On schema 15 those ranges are brace [0, 8], friction [0, 4], mass [0, 8], and ladder [0, 5]."
+            ),
+        ),
+        DecodeNote(
+            field="timeline.angle_cut",
+            confidence="inferred",
+            note=(
+                f"An angle cut is a merged run of {ANGLE_CUT_SEC:.2f} s windows in which this fighter's hips "
+                f"sweep at least {ANGLE_CUT_DEG:.0f} degrees around the opponent while the hips stay under {ANGLE_CUT_RANGE_M:.1f} m apart. "
+                "The timestamp is the start of the window with the largest sweep. "
+                "delta_deg is the signed sweep of the whole run, positive counterclockwise."
             ),
         ),
         DecodeNote(

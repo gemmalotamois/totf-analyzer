@@ -454,6 +454,8 @@ function RoundSection({
   const blueDef = round.defense.find((item) => item.corner === blue?.corner);
   const redGuard = redDef?.guard_discipline;
   const blueGuard = blueDef?.guard_discipline;
+  const redFoot = redDef?.footwork;
+  const blueFoot = blueDef?.footwork;
   const ending = roundEnding(round);
   const hands = handChart(round.offense);
   const punishment = seriesPoints(round.series, "punishment_0");
@@ -519,6 +521,23 @@ function RoundSection({
               <Row label="Head speed" red={num(redDef?.head_mean_speed ?? null, 2)} blue={num(blueDef?.head_mean_speed ?? null, 2)} />
               <Row label="Head speed under fire" red={num(redDef?.head_mean_speed_under_fire ?? null, 2)} blue={num(blueDef?.head_mean_speed_under_fire ?? null, 2)} />
               <Row label="Head height range" red={num(redDef?.head_vertical_range ?? null, 2)} blue={num(blueDef?.head_vertical_range ?? null, 2)} suffix=" m" />
+              <Row label="Radial distance" red={num(redFoot?.radial_distance_m ?? null, 1)} blue={num(blueFoot?.radial_distance_m ?? null, 1)} suffix=" m" />
+              <Row label="Lateral distance" red={num(redFoot?.tangential_distance_m ?? null, 1)} blue={num(blueFoot?.tangential_distance_m ?? null, 1)} suffix=" m" />
+              <Row label="Lateral share" red={pct(redFoot?.tangential_share ?? null)} blue={pct(blueFoot?.tangential_share ?? null)} />
+              <Row label="Clockwise" red={num(redFoot?.clockwise_distance_m ?? null, 1)} blue={num(blueFoot?.clockwise_distance_m ?? null, 1)} suffix=" m" />
+              <Row label="Counterclockwise" red={num(redFoot?.counterclockwise_distance_m ?? null, 1)} blue={num(blueFoot?.counterclockwise_distance_m ?? null, 1)} suffix=" m" />
+              <Row label="Angle cuts" red={redFoot?.angle_cut_count ?? null} blue={blueFoot?.angle_cut_count ?? null} />
+              <Row label="Entry angle" red={num(redFoot?.attack_entry_angle_deg ?? null, 1)} blue={num(blueFoot?.attack_entry_angle_deg ?? null, 1)} suffix="°" />
+              <Row label="Exit angle" red={num(redFoot?.post_combo_exit_angle_deg ?? null, 1)} blue={num(blueFoot?.post_combo_exit_angle_deg ?? null, 1)} suffix="°" />
+              <Row label="Range, mean" red={num(redFoot?.fighter_distance_m.mean ?? null, 2)} blue={num(blueFoot?.fighter_distance_m.mean ?? null, 2)} suffix=" m" />
+              <Row label="Clinch range" red={num(redFoot?.clinch_range_percent ?? null)} blue={num(blueFoot?.clinch_range_percent ?? null)} suffix="%" />
+              <Row label="Pocket range" red={num(redFoot?.pocket_range_percent ?? null)} blue={num(blueFoot?.pocket_range_percent ?? null)} suffix="%" />
+              <Row label="Outside range" red={num(redFoot?.outside_range_percent ?? null)} blue={num(blueFoot?.outside_range_percent ?? null)} suffix="%" />
+              <Row label="Shoulder blade" red={num(redFoot?.shoulder_blade_angle_deg ?? null, 1)} blue={num(blueFoot?.shoulder_blade_angle_deg ?? null, 1)} suffix="°" />
+              <Row label="Foot blade" red={num(redFoot?.foot_blade_angle_deg ?? null, 1)} blue={num(blueFoot?.foot_blade_angle_deg ?? null, 1)} suffix="°" />
+              <Row label="Square stance" red={num(redFoot?.square_stance_percent ?? null)} blue={num(blueFoot?.square_stance_percent ?? null)} suffix="%" />
+              <Row label="Lead left" red={num(redFoot?.lead_left_percent ?? null)} blue={num(blueFoot?.lead_left_percent ?? null)} suffix="%" />
+              <Row label="Square while punching" red={num(redFoot?.square_while_punching_percent ?? null)} blue={num(blueFoot?.square_while_punching_percent ?? null)} suffix="%" />
             </tbody>
           </table>
 
