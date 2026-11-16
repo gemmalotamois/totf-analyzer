@@ -456,6 +456,8 @@ function RoundSection({
   const blueGuard = blueDef?.guard_discipline;
   const redFoot = redDef?.footwork;
   const blueFoot = blueDef?.footwork;
+  const redHead = redDef?.head_movement;
+  const blueHead = blueDef?.head_movement;
   const ending = roundEnding(round);
   const hands = handChart(round.offense);
   const punishment = seriesPoints(round.series, "punishment_0");
@@ -521,6 +523,17 @@ function RoundSection({
               <Row label="Head speed" red={num(redDef?.head_mean_speed ?? null, 2)} blue={num(blueDef?.head_mean_speed ?? null, 2)} />
               <Row label="Head speed under fire" red={num(redDef?.head_mean_speed_under_fire ?? null, 2)} blue={num(blueDef?.head_mean_speed_under_fire ?? null, 2)} />
               <Row label="Head height range" red={num(redDef?.head_vertical_range ?? null, 2)} blue={num(blueDef?.head_vertical_range ?? null, 2)} suffix=" m" />
+              <Row label="Off centerline" red={num(redHead?.off_centerline_percent ?? null)} blue={num(blueHead?.off_centerline_percent ?? null)} suffix="%" />
+              <Row label="Off centerline under fire" red={num(redHead?.off_centerline_under_fire_percent ?? null)} blue={num(blueHead?.off_centerline_under_fire_percent ?? null)} suffix="%" />
+              <Row label="Off centerline while punching" red={num(redHead?.off_centerline_while_punching_percent ?? null)} blue={num(blueHead?.off_centerline_while_punching_percent ?? null)} suffix="%" />
+              <Row label="Lateral slip, median" red={num(redHead?.head_lateral_slip_m?.median ?? null, 2)} blue={num(blueHead?.head_lateral_slip_m?.median ?? null, 2)} suffix=" m" />
+              <Row label="Lateral slip, p90" red={num(redHead?.head_lateral_slip_m?.p90 ?? null, 2)} blue={num(blueHead?.head_lateral_slip_m?.p90 ?? null, 2)} suffix=" m" />
+              <Row label="Head height IQR" red={num(redHead?.head_height_iqr_m ?? null, 2)} blue={num(blueHead?.head_height_iqr_m ?? null, 2)} suffix=" m" />
+              <Row label="Head height span" red={num(redHead?.p05_p95_span_m ?? null, 2)} blue={num(blueHead?.p05_p95_span_m ?? null, 2)} suffix=" m" />
+              <Row label="Pelvis drop IQR" red={num(redHead?.pelvis_drop_iqr_m ?? null, 2)} blue={num(blueHead?.pelvis_drop_iqr_m ?? null, 2)} suffix=" m" />
+              <Row label="Trunk bend IQR" red={num(redHead?.trunk_bend_iqr_m ?? null, 2)} blue={num(blueHead?.trunk_bend_iqr_m ?? null, 2)} suffix=" m" />
+              <Row label="Ducks" red={redHead?.duck_count ?? null} blue={blueHead?.duck_count ?? null} />
+              <Row label="Bob and weave" red={redHead?.bob_and_weave_count ?? null} blue={blueHead?.bob_and_weave_count ?? null} />
               <Row label="Radial distance" red={num(redFoot?.radial_distance_m ?? null, 1)} blue={num(blueFoot?.radial_distance_m ?? null, 1)} suffix=" m" />
               <Row label="Lateral distance" red={num(redFoot?.tangential_distance_m ?? null, 1)} blue={num(blueFoot?.tangential_distance_m ?? null, 1)} suffix=" m" />
               <Row label="Lateral share" red={pct(redFoot?.tangential_share ?? null)} blue={pct(blueFoot?.tangential_share ?? null)} />

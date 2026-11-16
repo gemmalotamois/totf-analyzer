@@ -99,6 +99,7 @@ def get_fighter_stats(path: str, corner: int) -> dict:
                 "received_damage_official": round_defense.received_damage_official,
                 "guard_discipline": round_defense.guard_discipline.model_dump(),
                 "footwork": round_defense.footwork.model_dump(),
+                "head_movement": round_defense.head_movement.model_dump(),
             }
         rounds.append(row)
     return {
@@ -111,7 +112,7 @@ def get_fighter_stats(path: str, corner: int) -> dict:
 
 @mcp.tool()
 def get_key_moments(path: str, type: str | None = None) -> list[dict]:
-    """Timestamped moments. Optional `type` filters stun, knockdown, knockout, exchange, angle_cut, and the other moment types."""
+    """Timestamped moments. Optional `type` filters stun, knockdown, knockout, exchange, angle_cut, duck, bob_and_weave, and the other moment types."""
     moments = _load(path).key_moments
     if type:
         moments = [moment for moment in moments if moment.type == type]

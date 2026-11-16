@@ -19,6 +19,7 @@ from totf_analyzer.models.analytics import (
     FootworkStats,
     GuardDisciplineStats,
     HandStats,
+    HeadMovementStats,
     HistogramBin,
     KeyMoment,
     MedianP90,
@@ -29,6 +30,7 @@ from totf_analyzer.models.analytics import (
     RoundScore,
     Series,
     SessionFacts,
+    SlipSpread,
     TrajectoryStats,
     VelocityStats,
 )
@@ -96,6 +98,13 @@ COMBO_GAP_SEC = 0.65
 COMBO_EXIT_SEC = 0.5
 MIN_RANGE_M = 1.0e-3
 MIN_LINE_M = 1.0e-4
+# Head slip is measured on the same bell span and opponent frame as footwork.
+OFF_CENTERLINE_M = 0.10
+DUCK_DROP_M = 0.15
+DUCK_WINDOW_SEC = 0.8
+WEAVE_DROP_M = 0.12
+WEAVE_SLIP_M = 0.12
+WEAVE_WINDOW_SEC = 1.0
 
 # Event type codes whose counts line up with scorecard totals on schema 15.
 COUNT_MATCHED_EVENTS = (
@@ -180,6 +189,16 @@ def _measure(
         track.corner: _footwork(track, session.tracks[_opponent(session, track.corner)], spans, session.fixed_timestep)
         for track in _ordered(session)
     }
+    movement: dict[int, tuple[HeadMovementStats, list[_HeadEvent], list[_HeadEvent]]] = {
+        track.corner: _head_movement(
+            session,
+            track,
+            session.tracks[_opponent(session, track.corner)],
+            spans,
+            session.fixed_timestep,
+        )
+        for track in _ordered(session)
+    }
     defense = [
         _defense(
             session,
@@ -189,11 +208,20 @@ def _measure(
             notes,
             punch_guards[track.corner],
             footwork[track.corner][0],
+            movement[track.corner][0],
         )
         for track in _ordered(session)
     ]
     moments = _key_moments(session, matches, bodies, totals, notes, clock_ticks)
     moments.extend(_angle_cut_moments(session, {corner: cuts for corner, (_stats, cuts) in footwork.items()}))
+    moments.extend(_head_event_moments(session, {corner: ducks for corner, (_stats, ducks, _weaves) in movement.items()}, "duck"))
+    moments.extend(
+        _head_event_moments(
+            session,
+            {corner: weaves for corner, (_stats, _ducks, weaves) in movement.items()},
+            "bob_and_weave",
+        )
+    )
     moments.sort(key=lambda item: (item.t_sec, item.type))
     return (
         offense,
@@ -1616,6 +1644,180 @@ def _angle_cut_moments(session: ParsedSession, cuts: dict[int, list[_AngleCut]])
     return moments
 
 
+@dataclass(frozen=True)
+class _HeadEvent:
+    tick: int
+    drop_m: float
+    duration_sec: float
+    slip_delta_m: float | None = None
+
+
+def _empty_head_movement() -> HeadMovementStats:
+    return HeadMovementStats()
+
+
+def _iqr(samples: np.ndarray) -> float:
+    return float(np.percentile(samples, 75) - np.percentile(samples, 25))
+
+
+def _punching_mask(ticks: np.ndarray, in_bell: np.ndarray, punches: list[PunchRecord]) -> np.ndarray:
+    mask = np.zeros(len(ticks), dtype=bool)
+    for punch in punches:
+        if punch.tick < punch.launch_tick:
+            continue
+        mask |= in_bell & (ticks >= punch.launch_tick) & (ticks <= punch.tick)
+    return mask
+
+
+def _off_center_percent(abs_slip: np.ndarray, mask: np.ndarray) -> float | None:
+    selected = abs_slip[mask]
+    if len(selected) == 0:
+        return None
+    return float(np.mean(selected >= OFF_CENTERLINE_M) * 100.0)
+
+
+def _slip_spread(samples: np.ndarray, under_fire: np.ndarray) -> SlipSpread:
+    if len(samples) == 0:
+        return SlipSpread()
+    fired = samples[under_fire] if len(under_fire) == len(samples) else samples[:0]
+    return SlipSpread(
+        median=_finite(float(np.percentile(samples, 50))),
+        p90=_finite(float(np.percentile(samples, 90))),
+        under_fire_p90=_finite(float(np.percentile(fired, 90))) if len(fired) else None,
+    )
+
+
+def _u_shapes(
+    ticks: np.ndarray,
+    height: np.ndarray,
+    in_bell: np.ndarray,
+    slip: np.ndarray | None,
+    timestep: float,
+    window_sec: float,
+    drop_m: float,
+    slip_m: float | None,
+) -> list[_HeadEvent]:
+    """Merged U-shaped head drops on consecutive bell-span frames."""
+    span = int(round(window_sec / timestep))
+    count = len(ticks)
+    if span <= 1 or count <= span or timestep <= 0:
+        return []
+    step_valid = np.diff(ticks) == 1
+    steps_ok = _rolling_sum(step_valid.astype(np.float64), span) == span
+    frame_ok = _rolling_sum(in_bell.astype(np.float64), span + 1) == span + 1
+    windows = np.lib.stride_tricks.sliding_window_view(height, span + 1)
+    width = min(len(frame_ok), len(steps_ok), len(windows))
+    if width <= 0:
+        return []
+    windows = windows[:width]
+    trough = windows.argmin(axis=1)
+    inside = (trough > 0) & (trough < span)
+    trough_y = windows[np.arange(width), trough]
+    fall = windows[:, 0] - trough_y
+    rise = windows[:, -1] - trough_y
+    qualifying_mask = frame_ok[:width] & steps_ok[:width] & inside & (fall >= drop_m) & (rise >= drop_m)
+    slip_range = None
+    if slip_m is not None and slip is not None:
+        slip_windows = np.lib.stride_tricks.sliding_window_view(slip, span + 1)[:width]
+        slip_range = slip_windows.max(axis=1) - slip_windows.min(axis=1)
+        qualifying_mask = qualifying_mask & (slip_range >= slip_m)
+    qualifying = np.flatnonzero(qualifying_mask)
+    if len(qualifying) == 0:
+        return []
+    groups: list[list[int]] = [[int(qualifying[0])]]
+    for start in qualifying[1:]:
+        if int(start) <= groups[-1][-1] + span:
+            groups[-1].append(int(start))
+        else:
+            groups.append([int(start)])
+    events: list[_HeadEvent] = []
+    for group in groups:
+        best = max(group, key=lambda start: float(fall[start]))
+        events.append(
+            _HeadEvent(
+                tick=int(ticks[best + int(trough[best])]),
+                drop_m=float(fall[best]),
+                duration_sec=(group[-1] + span - group[0]) * timestep,
+                slip_delta_m=None if slip_range is None else float(slip_range[best]),
+            )
+        )
+    return events
+
+
+def _head_movement(
+    session: ParsedSession,
+    track: TrackData,
+    opponent: TrackData,
+    spans: list[tuple[int, int]],
+    timestep: float,
+) -> tuple[HeadMovementStats, list[_HeadEvent], list[_HeadEvent]]:
+    """Bell-span slip, level change, ducks, and bob-and-weave on the opponent frame."""
+    ticks = track.skeleton_ticks.astype(np.int64)
+    if len(ticks) == 0 or not spans or len(opponent.skeleton_ticks) == 0 or timestep <= 0:
+        return _empty_head_movement(), [], []
+    right = _local_axes(track, opponent)[1]
+    pos = track.skeleton_pos.astype(np.float64)
+    offset = pos[:, HEAD] - pos[:, HIPS]
+    slip_lat = np.sum(offset * right, axis=1)
+    in_bell = np.zeros(len(ticks), dtype=bool)
+    for start, stop in spans:
+        in_bell |= (ticks >= start) & (ticks <= stop)
+    if not np.any(in_bell):
+        return _empty_head_movement(), [], []
+    under_fire = _under_fire_mask(session, track, {"ticks": ticks}) & in_bell
+    punching = _punching_mask(ticks, in_bell, track.punches)
+    abs_slip = np.abs(slip_lat)
+    head_y = pos[in_bell, HEAD, 1]
+    hips_y = pos[in_bell, HIPS, 1]
+    pelvis_drop = float(np.percentile(hips_y, 90)) - hips_y
+    ducks = _u_shapes(ticks, pos[:, HEAD, 1], in_bell, None, timestep, DUCK_WINDOW_SEC, DUCK_DROP_M, None)
+    weaves = _u_shapes(
+        ticks,
+        pos[:, HEAD, 1],
+        in_bell,
+        slip_lat,
+        timestep,
+        WEAVE_WINDOW_SEC,
+        WEAVE_DROP_M,
+        WEAVE_SLIP_M,
+    )
+    stats = HeadMovementStats(
+        head_lateral_slip_m=_slip_spread(abs_slip[in_bell], under_fire[in_bell]),
+        off_centerline_percent=_finite(_off_center_percent(abs_slip, in_bell)),
+        off_centerline_under_fire_percent=_finite(_off_center_percent(abs_slip, under_fire)),
+        off_centerline_while_punching_percent=_finite(_off_center_percent(abs_slip, punching)),
+        head_height_iqr_m=_finite(_iqr(head_y)),
+        p05_p95_span_m=_finite(float(np.percentile(head_y, 95) - np.percentile(head_y, 5))),
+        pelvis_drop_iqr_m=_finite(_iqr(pelvis_drop)),
+        trunk_bend_iqr_m=_finite(_iqr(head_y - hips_y)),
+        duck_count=len(ducks),
+        bob_and_weave_count=len(weaves),
+    )
+    return stats, ducks, weaves
+
+
+def _head_event_moments(session: ParsedSession, events: dict[int, list[_HeadEvent]], type_name: str) -> list[KeyMoment]:
+    moments: list[KeyMoment] = []
+    for corner, rows in events.items():
+        for event in rows:
+            detail = {
+                "drop_m": round(event.drop_m, 4),
+                "duration_sec": round(event.duration_sec, 4),
+            }
+            if event.slip_delta_m is not None:
+                detail["slip_delta_m"] = round(event.slip_delta_m, 4)
+            moments.append(
+                KeyMoment(
+                    t_sec=_sec(session, event.tick),
+                    tick=event.tick,
+                    type=type_name,
+                    corners=[corner],
+                    detail=detail,
+                )
+            )
+    return moments
+
+
 def _defense(
     session: ParsedSession,
     track: TrackData,
@@ -1624,6 +1826,7 @@ def _defense(
     notes: list[DecodeNote],
     punch_guards: list[_PunchGuard],
     footwork: FootworkStats,
+    head_movement: HeadMovementStats,
 ) -> DefenseStats:
     mask = _under_fire_mask(session, track, body)
     guard = body["guard"]
@@ -1676,6 +1879,7 @@ def _defense(
         received_damage_official=float(totals.get(track.corner, {}).get("received_damage", 0.0)),
         guard_discipline=_guard_discipline(body, mask, punch_guards, track.stance, track.corner, notes),
         footwork=footwork,
+        head_movement=head_movement,
     )
 
 
@@ -2114,6 +2318,27 @@ def _static_notes() -> list[DecodeNote]:
             ),
         ),
         DecodeNote(
+            field="defense.head_movement",
+            confidence="inferred",
+            note=(
+                f"Head movement uses head joint {HEAD} and hips joint {HIPS} from each round's bell through the end bell. "
+                "The warning and the time after the end bell are left out, and a window never crosses a gap in skeleton ticks. "
+                "Lateral slip is the absolute projection of (head - hips) onto the fighter's right, the same tangential axis as footwork. "
+                f"Off centerline is a slip of at least {OFF_CENTERLINE_M:.2f} m. "
+                "Under fire is the 0.05 s before through 0.30 s after each opponent punch record, inside the bell span. "
+                "While punching is a bell-span frame whose tick lies inside this fighter's own launch-to-end punch interval. "
+                "head_height_iqr_m is the interquartile range of head height. "
+                "p05_p95_span_m is the 95th percentile of head height minus the 5th. "
+                "pelvis_drop_iqr_m is the interquartile range of hips height below its 90th percentile. "
+                "trunk_bend_iqr_m is the interquartile range of head height minus hips height. "
+                f"A duck is a merged run of {DUCK_WINDOW_SEC:.1f} s windows in which head height falls and rises "
+                f"at least {DUCK_DROP_M:.2f} m around an interior trough. "
+                f"A bob-and-weave is a merged run of {WEAVE_WINDOW_SEC:.1f} s windows with that U-shape at "
+                f"{WEAVE_DROP_M:.2f} m and a lateral-slip range of at least {WEAVE_SLIP_M:.2f} m. "
+                "The two counts are independent. Quest hips are the recorded root joint, not an optical foot measurement."
+            ),
+        ),
+        DecodeNote(
             field="defense.punishment",
             confidence="inferred",
             note="punishment_0/1/2 are the three float meters in punishment.bin. They are not the official received-damage total.",
@@ -2135,6 +2360,25 @@ def _static_notes() -> list[DecodeNote]:
                 f"sweep at least {ANGLE_CUT_DEG:.0f} degrees around the opponent while the hips stay under {ANGLE_CUT_RANGE_M:.1f} m apart. "
                 "The timestamp is the start of the window with the largest sweep. "
                 "delta_deg is the signed sweep of the whole run, positive counterclockwise."
+            ),
+        ),
+        DecodeNote(
+            field="timeline.duck",
+            confidence="inferred",
+            note=(
+                f"A duck is a merged run of {DUCK_WINDOW_SEC:.1f} s windows on consecutive bell-span frames "
+                f"in which head height falls and rises at least {DUCK_DROP_M:.2f} m around an interior trough. "
+                "The timestamp is the trough of the window with the largest fall. drop_m is that fall."
+            ),
+        ),
+        DecodeNote(
+            field="timeline.bob_and_weave",
+            confidence="inferred",
+            note=(
+                f"A bob-and-weave is a merged run of {WEAVE_WINDOW_SEC:.1f} s windows on consecutive bell-span frames "
+                f"in which head height falls and rises at least {WEAVE_DROP_M:.2f} m and lateral slip ranges "
+                f"at least {WEAVE_SLIP_M:.2f} m. "
+                "The timestamp is the trough of the window with the largest fall. slip_delta_m is that window's slip range."
             ),
         ),
         DecodeNote(
