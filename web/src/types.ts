@@ -1,0 +1,130 @@
+export type CornerRound = {
+  score: number;
+  hits: number;
+  received_damage: number;
+  stuns: number;
+  punishment_stuns: number;
+  knockdowns: number;
+  punishment_knockdowns: number;
+  all_knockdowns: number;
+  knocked_out: boolean;
+  technically_knocked_out: boolean;
+  fouls: number;
+};
+
+export type FightAnalytics = {
+  session: {
+    name: string;
+    source: string;
+    venue: string | null;
+    duration_sec: number;
+    method: string;
+    winner_corner: number | null;
+    winner_color: string | null;
+    red_total_score: number | null;
+    blue_total_score: number | null;
+    rounds_scheduled: number;
+    round_duration_sec: number;
+  };
+  fighters: {
+    corner: number;
+    color: string;
+    name: string;
+    is_local_player: boolean;
+    stance: string | null;
+    height_m: number | null;
+    ai_archetype: string | null;
+    ai_difficulty: string | null;
+  }[];
+  rounds: {
+    index: number;
+    completed: boolean;
+    red: CornerRound;
+    blue: CornerRound;
+    bell_sec: number | null;
+    end_sec: number | null;
+    duration_sec: number | null;
+    offense: FightAnalytics["offense"];
+    defense: FightAnalytics["defense"];
+    key_moments: FightAnalytics["key_moments"];
+    series: FightAnalytics["series"];
+  }[];
+  offense: {
+    corner: number;
+    thrown: number;
+    kinematic_thrown: number;
+    landed: number;
+    official_hits: number;
+    accuracy: number | null;
+    punches_per_minute: number;
+    hands: { hand: string; thrown: number; landed: number; accuracy: number | null; mean_speed: number | null }[];
+    trajectories: {
+      trajectory: string;
+      thrown: number;
+      landed: number;
+      accuracy: number | null;
+      mean_speed: number | null;
+    }[];
+    velocity: {
+      samples: number;
+      mean_thrown: number | null;
+      mean_landed: number | null;
+      max_speed: number | null;
+      mean_punishment_delta_landed: number | null;
+      speed_punishment_correlation: number | null;
+      histogram: { lo: number; hi: number; count: number }[];
+    };
+    punches: {
+      t_sec: number;
+      hand: string;
+      trajectory: string;
+      speed: number | null;
+      landed: boolean;
+      punishment_delta: number | null;
+    }[];
+  }[];
+  defense: {
+    corner: number;
+    guard_up_percent: number | null;
+    guard_up_percent_under_fire: number | null;
+    under_fire_seconds: number;
+    head_mean_speed: number | null;
+    head_mean_speed_under_fire: number | null;
+    head_mean_speed_not_under_fire: number | null;
+    head_vertical_range: number | null;
+    head_lateral_range: number | null;
+    punishment_peak: number[];
+    received_damage_official: number;
+  }[];
+  key_moments: {
+    t_sec: number;
+    tick: number;
+    type: string;
+    corners: number[];
+    detail: Record<string, string | number | null>;
+  }[];
+  series: { name: string; corner: number | null; t: number[]; y: number[] }[];
+  decode_status: { field: string; confidence: string; note: string }[];
+};
+
+export type SessionRow = {
+  name: string;
+  size: number;
+  modified: number;
+  bout: string | null;
+  created: string | null;
+  red: string | null;
+  blue: string | null;
+  winner: "red" | "blue" | null;
+  method: "KO" | "TKO" | "UD" | "draw" | null;
+  local: "red" | "blue" | null;
+  result: string | null;
+};
+
+export type GameRecording = SessionRow & { imported: boolean };
+
+export type GameListing = {
+  directory: string;
+  available: boolean;
+  recordings: GameRecording[];
+};

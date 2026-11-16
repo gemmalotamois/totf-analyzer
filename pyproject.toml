@@ -1,0 +1,31 @@
+[project]
+name = "totf-analyzer"
+version = "0.1.0"
+description = "Factual analytics for Thrill of the Fight 2 session recordings."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.115",
+  "uvicorn>=0.32",
+  "mcp>=2",
+  "pydantic>=2.6",
+  "numpy>=1.26",
+  "python-multipart>=0.0.9",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "httpx>=0.27"]
+
+[project.scripts]
+totf-analyzer = "totf_analyzer.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
