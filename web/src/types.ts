@@ -113,11 +113,17 @@ export type FightAnalytics = {
     };
     punches: {
       t_sec: number;
+      launch_sec?: number | null;
+      impact_sec?: number | null;
       hand: string;
       trajectory: string;
       speed: number | null;
       landed: boolean;
       punishment_delta: number | null;
+      combo_id?: number | null;
+      combo_depth?: string | null;
+      countered?: boolean;
+      head_slip_m?: number | null;
       offhand_in_guard: boolean | null;
       offhand_drop_m: number | null;
       offhand_flare_m: number | null;

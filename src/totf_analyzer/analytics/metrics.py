@@ -1133,6 +1133,32 @@ def _punch_guard(track: TrackData, opponent: TrackData, timestep: float) -> list
     return rows
 
 
+def _launch_slips(track: TrackData, opponent: TrackData) -> list[float | None]:
+    punches = track.punches
+    if not punches:
+        return []
+    ticks = track.skeleton_ticks.astype(np.int64)
+    if len(ticks) == 0 or len(opponent.skeleton_ticks) == 0:
+        return [None for _ in punches]
+    right = _local_axes(track, opponent)[1]
+    pos = track.skeleton_pos.astype(np.float64)
+    slip_lat = np.sum((pos[:, HEAD] - pos[:, HIPS]) * right, axis=1)
+    by_tick = {int(tick): float(slip_lat[index]) for index, tick in enumerate(ticks)}
+    nearest = _nearest_index(ticks, np.array([punch.launch_tick for punch in punches], dtype=np.int64))
+    out: list[float | None] = []
+    for index, punch in enumerate(punches):
+        exact = by_tick.get(punch.launch_tick)
+        if exact is not None:
+            out.append(round(exact, 4))
+            continue
+        near_idx = int(nearest[index])
+        if abs(int(ticks[near_idx]) - punch.launch_tick) <= 1:
+            out.append(round(float(slip_lat[near_idx]), 4))
+        else:
+            out.append(None)
+    return out
+
+
 def _offense(
     session: ParsedSession,
     track: TrackData,
@@ -1146,6 +1172,7 @@ def _offense(
 ) -> OffenseStats:
     defender = session.tracks[_opponent(session, track.corner)]
     trajectories = _punch_trajectories(track, defender, notes)
+    launch_slips = _launch_slips(track, defender)
     received = landed_events[defender.corner]
     # m_hits on a corner is hits that fighter took. The punch that landed is on the defender's card.
     official = int(totals.get(defender.corner, {}).get("hits", 0))
@@ -1158,13 +1185,16 @@ def _offense(
     corr_speed: list[float] = []
     corr_delta: list[float] = []
     for index, punch in enumerate(track.punches):
-        landed = index in matched
+        hit_event = matched.get(index)
+        landed = hit_event is not None
         delta = _punishment_delta(defender, punch.tick) if landed else None
         hand = labels.get(punch.hand_index, f"hand_{punch.hand_index}")
         trajectory = trajectories[index]
         guard = punch_guards[index]
         row = PunchRow(
             t_sec=_sec(session, punch.tick),
+            launch_sec=_sec(session, punch.launch_tick),
+            impact_sec=_sec(session, hit_event.tick) if hit_event is not None else None,
             tick=punch.tick,
             hand=hand,
             hand_index=punch.hand_index,
@@ -1172,6 +1202,7 @@ def _offense(
             speed=_finite(punch.speed),
             landed=landed,
             punishment_delta=_finite(delta),
+            head_slip_m=_finite(launch_slips[index]),
             offhand_in_guard=guard.offhand_in_guard,
             offhand_drop_m=_finite(guard.offhand_drop_m),
             offhand_flare_m=_finite(guard.offhand_flare_m),
@@ -1632,11 +1663,14 @@ def _combination_stats(
     depth_speeds: dict[str, list[float]] = {label: [] for label in DEPTH_LABELS}
     depth_countered = {label: 0 for label in DEPTH_LABELS}
     patterns: dict[str, list[list[_GroupedPunch]]] = defaultdict(list)
-    for group in groups:
+    for combo_id, group in enumerate(groups, start=1):
         tokens: list[str] = []
         for place, member in enumerate(group, start=1):
             row = rows[member.index]
             label = "5+" if place >= 5 else str(place)
+            row.combo_id = combo_id
+            row.combo_depth = label
+            row.countered = member.index in countered
             depth_thrown[label] += 1
             if row.landed:
                 depth_landed[label] += 1
@@ -2485,6 +2519,10 @@ def _series(session: ParsedSession, bodies: dict[int, dict]) -> list[Series]:
         t_body = np.array([_sec(session, int(tick)) for tick in body["ticks"]])
         ts, ys = _bucket(t_body, body["guard"].astype(np.float32), 1.0)
         series.append(Series(name="guard_up", corner=track.corner, t=ts, y=ys))
+        ts, ys = _bucket(t_body, body["left_guard"].astype(np.float32), 1.0)
+        series.append(Series(name="left_guard_up", corner=track.corner, t=ts, y=ys))
+        ts, ys = _bucket(t_body, body["right_guard"].astype(np.float32), 1.0)
+        series.append(Series(name="right_guard_up", corner=track.corner, t=ts, y=ys))
         head = body["head_xyz"]
         if len(head) > 1:
             speed = _head_speed(head, session.fixed_timestep)
@@ -2492,6 +2530,33 @@ def _series(session: ParsedSession, bodies: dict[int, dict]) -> list[Series]:
             series.append(Series(name="head_speed", corner=track.corner, t=ts, y=ys))
             ts, ys = _bucket(t_body, head[:, 1], SERIES_STEP_SEC)
             series.append(Series(name="head_height", corner=track.corner, t=ts, y=ys))
+        opponent = session.tracks[_opponent(session, track.corner)]
+        ticks = track.skeleton_ticks.astype(np.int64)
+        if len(ticks) and len(opponent.skeleton_ticks) and session.fixed_timestep > 0:
+            forward, right = _local_axes(track, opponent)
+            pos = track.skeleton_pos.astype(np.float64)
+            slip_lat = np.sum((pos[:, HEAD] - pos[:, HIPS]) * right, axis=1)
+            ts, ys = _bucket(t_body, slip_lat, SERIES_STEP_SEC)
+            series.append(Series(name="head_slip_lateral", corner=track.corner, t=ts, y=ys))
+            nearest = _nearest_index(opponent.skeleton_ticks.astype(np.int64), ticks)
+            delta = opponent.skeleton_pos[nearest, HIPS].astype(np.float64) - pos[:, HIPS]
+            delta[:, 1] = 0.0
+            distance = np.linalg.norm(delta, axis=1)
+            ts, ys = _bucket(t_body, distance, SERIES_STEP_SEC)
+            series.append(Series(name="fighter_distance", corner=track.corner, t=ts, y=ys))
+            shoulder, shoulder_ok = _line_angle(pos, L_SHOULDER, R_SHOULDER, forward, right)
+            ts, ys = _bucket(t_body[shoulder_ok], shoulder[shoulder_ok], SERIES_STEP_SEC)
+            series.append(Series(name="blade_angle", corner=track.corner, t=ts, y=ys))
+            if len(ticks) > 1:
+                step = np.diff(pos[:, HIPS], axis=0)
+                step[:, 1] = 0.0
+                step_valid = np.diff(ticks) == 1
+                tangent_speed = np.sum(step * right[:-1], axis=1) / session.fixed_timestep
+                ts, ys = _bucket(t_body[1:][step_valid], tangent_speed[step_valid], SERIES_STEP_SEC)
+                series.append(Series(name="tangential_speed", corner=track.corner, t=ts, y=ys))
+        else:
+            for name in ("head_slip_lateral", "fighter_distance", "blade_angle", "tangential_speed"):
+                series.append(Series(name=name, corner=track.corner, t=[], y=[]))
         t_stiff = np.array([_sec(session, int(tick)) for tick in track.stiffness_ticks])
         stiff = np.max(track.stiffness, axis=1)
         ts, ys = _bucket(t_stiff, stiff, SERIES_STEP_SEC)
@@ -2687,12 +2752,35 @@ def _static_notes() -> list[DecodeNote]:
             note="punishment_0/1/2 are the three float meters in punishment.bin. They are not the official received-damage total.",
         ),
         DecodeNote(
+            field="offense.punches",
+            confidence="inferred",
+            note=(
+                "launch_sec is the punch record's launch_tick (offset 12) and t_sec is its end tick (offset 0). "
+                "impact_sec is the matched defender scored-hit tick when the punch landed. "
+                "combo_id (1-based within the offense block), combo_depth (1..4, 5+), and countered "
+                "use the same launch-gap groups and counter windows as offense.combinations. "
+                "head_slip_m is the signed projection of (head - hips) onto the fighter's right at launch_tick."
+            ),
+        ),
+        DecodeNote(
             field="series.guard_brace",
             confidence="confirmed",
             note=(
                 "guard_brace, guard_friction, guard_mass, and guard_ladder are the first sample of each named channel, "
                 "scaled from uint16 by that channel's header min and max. "
                 "On schema 15 those ranges are brace [0, 8], friction [0, 4], mass [0, 8], and ladder [0, 5]."
+            ),
+        ),
+        DecodeNote(
+            field="series.biomechanics",
+            confidence="inferred",
+            note=(
+                "left_guard_up and right_guard_up are 1.0 s bucket shares in [0, 1] using the same head-relative box as guard_up. "
+                "head_slip_lateral, fighter_distance, blade_angle, and tangential_speed are 0.25 s bucket means on the opponent frame. "
+                "head_slip_lateral is signed (head - hips) on the fighter's right. "
+                "fighter_distance is horizontal hip-to-hip distance. "
+                "blade_angle is the signed shoulder line angle (0 square, positive lead-left). "
+                "tangential_speed is signed hips speed along the fighter's right on consecutive ticks (positive counterclockwise)."
             ),
         ),
         DecodeNote(

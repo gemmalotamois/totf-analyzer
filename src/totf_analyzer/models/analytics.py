@@ -113,6 +113,8 @@ class VelocityStats(BaseModel):
 
 class PunchRow(BaseModel):
     t_sec: float
+    launch_sec: float | None = None
+    impact_sec: float | None = None
     tick: int
     hand: str
     hand_index: int
@@ -120,6 +122,10 @@ class PunchRow(BaseModel):
     speed: float | None = None
     landed: bool
     punishment_delta: float | None = None
+    combo_id: int | None = None
+    combo_depth: str | None = None
+    countered: bool = False
+    head_slip_m: float | None = None
     # Off-hand fields are null without a peak-extension frame. Retraction fields
     # are also null for a same-hand double-up or a miss inside 800 ms.
     offhand_in_guard: bool | None = None
