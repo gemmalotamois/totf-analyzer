@@ -199,6 +199,54 @@ class FootworkStats(BaseModel):
     square_while_punching_percent: float | None = None
 
 
+class DepthStats(BaseModel):
+    depth: str
+    thrown: int
+    landed: int
+    accuracy: float | None = None
+    mean_speed: float | None = None
+    countered_count: int = 0
+    countered_rate: float | None = None
+
+
+class ComboPatternStats(BaseModel):
+    pattern: str
+    count: int
+    length: int
+    thrown: int
+    landed: int
+    accuracy: float | None = None
+    mean_speed: float | None = None
+    mean_punishment_delta: float | None = None
+    mean_punishment_delta_landed: float | None = None
+
+
+class CombinationStats(BaseModel):
+    combo_count: int = 0
+    mean_combo_length: float | None = None
+    max_combo_length: int = 0
+    single_shot_percent: float | None = None
+    alternating_hand_percent: float | None = None
+    by_depth: list[DepthStats] = Field(default_factory=list)
+    patterns: list[ComboPatternStats] = Field(default_factory=list)
+
+
+class VulnerabilityWindow(BaseModel):
+    hits: int = 0
+    hit_share: float | None = None
+    time_share: float | None = None
+    risk_ratio: float | None = None
+    opponent_thrown: int = 0
+    opponent_landed: int = 0
+    opponent_accuracy: float | None = None
+
+
+class VulnerabilityStats(BaseModel):
+    while_throwing: VulnerabilityWindow = Field(default_factory=VulnerabilityWindow)
+    post_punch_recovery: VulnerabilityWindow = Field(default_factory=VulnerabilityWindow)
+    neutral_guard: VulnerabilityWindow = Field(default_factory=VulnerabilityWindow)
+
+
 class GuardDisciplineStats(BaseModel):
     left_guard_up_percent: float | None = None
     right_guard_up_percent: float | None = None
@@ -233,6 +281,7 @@ class OffenseStats(BaseModel):
     trajectories: list[TrajectoryStats]
     velocity: VelocityStats
     punches: list[PunchRow]
+    combinations: CombinationStats = Field(default_factory=CombinationStats)
 
 
 class DefenseStats(BaseModel):
@@ -251,6 +300,7 @@ class DefenseStats(BaseModel):
     guard_discipline: GuardDisciplineStats = Field(default_factory=GuardDisciplineStats)
     footwork: FootworkStats = Field(default_factory=FootworkStats)
     head_movement: HeadMovementStats = Field(default_factory=HeadMovementStats)
+    vulnerability: VulnerabilityStats = Field(default_factory=VulnerabilityStats)
 
 
 class KeyMoment(BaseModel):

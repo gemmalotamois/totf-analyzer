@@ -12,6 +12,16 @@ export type CornerRound = {
   fouls: number;
 };
 
+export type VulnerabilityWindow = {
+  hits: number;
+  hit_share: number | null;
+  time_share: number | null;
+  risk_ratio: number | null;
+  opponent_thrown: number;
+  opponent_landed: number;
+  opponent_accuracy: number | null;
+};
+
 export type FightAnalytics = {
   session: {
     name: string;
@@ -73,6 +83,33 @@ export type FightAnalytics = {
       mean_punishment_delta_landed: number | null;
       speed_punishment_correlation: number | null;
       histogram: { lo: number; hi: number; count: number }[];
+    };
+    combinations: {
+      combo_count: number;
+      mean_combo_length: number | null;
+      max_combo_length: number;
+      single_shot_percent: number | null;
+      alternating_hand_percent: number | null;
+      by_depth: {
+        depth: string;
+        thrown: number;
+        landed: number;
+        accuracy: number | null;
+        mean_speed: number | null;
+        countered_count: number;
+        countered_rate: number | null;
+      }[];
+      patterns: {
+        pattern: string;
+        count: number;
+        length: number;
+        thrown: number;
+        landed: number;
+        accuracy: number | null;
+        mean_speed: number | null;
+        mean_punishment_delta: number | null;
+        mean_punishment_delta_landed: number | null;
+      }[];
     };
     punches: {
       t_sec: number;
@@ -153,6 +190,11 @@ export type FightAnalytics = {
       trunk_bend_iqr_m: number | null;
       duck_count: number;
       bob_and_weave_count: number;
+    };
+    vulnerability: {
+      while_throwing: VulnerabilityWindow;
+      post_punch_recovery: VulnerabilityWindow;
+      neutral_guard: VulnerabilityWindow;
     };
   }[];
   key_moments: {

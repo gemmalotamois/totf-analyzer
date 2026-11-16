@@ -306,6 +306,10 @@ td.num { font-variant-numeric: tabular-nums; }
 .tag.blue { color: var(--blue); }
 
 .log { max-height: 360px; overflow: auto; }
+.combo-block { margin: 8px 0 28px; }
+.combo-block .meta { margin: 0 0 12px; }
+.combo-tables { display: grid; gap: 22px; }
+.combo-tables .log { max-height: 420px; }
 .landed { color: var(--amber); }
 
 details { margin-top: 28px; color: var(--muted); }
