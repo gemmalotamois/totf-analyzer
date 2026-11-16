@@ -28,6 +28,10 @@ function pct(value: number | null): string {
   return value == null ? "—" : `${(value * 100).toFixed(1)}%`;
 }
 
+function percentPoints(value: number | null | undefined): string {
+  return value == null ? "—" : `${num(value)}%`;
+}
+
 function num(value: number | null, digits = 1): string {
   return value == null ? "—" : value.toFixed(digits);
 }
@@ -415,6 +419,8 @@ function FightView({ report }: { report: FightAnalytics }) {
         </table>
       )}
 
+      <ComboSection title="Combinations" offense={report.offense} defense={report.defense} />
+
       {selected && <RoundSection key={selected.index} report={report} round={selected} />}
 
       <details>
@@ -435,6 +441,184 @@ function roundEnding(round: FightAnalytics["rounds"][number]): string | null {
   if (round.red.technically_knocked_out) return "Red TKO";
   if (round.blue.technically_knocked_out) return "Blue TKO";
   return null;
+}
+
+const DEPTHS = ["1", "2", "3", "4", "5+"];
+const VULNERABILITY = [
+  ["while_throwing", "While throwing"],
+  ["post_punch_recovery", "After punch"],
+  ["neutral_guard", "Neutral guard"],
+] as const;
+
+type ComboPattern = FightAnalytics["offense"][number]["combinations"]["patterns"][number];
+
+function patternNames(red: ComboPattern[], blue: ComboPattern[]): string[] {
+  const counts = new Map<string, number>();
+  for (const row of [...red, ...blue]) {
+    counts.set(row.pattern, Math.max(counts.get(row.pattern) ?? 0, row.count));
+  }
+  return [...counts.keys()].sort((left, right) => (counts.get(right) ?? 0) - (counts.get(left) ?? 0) || left.localeCompare(right));
+}
+
+function ComboSection({
+  title,
+  offense,
+  defense,
+  heading = "h2",
+}: {
+  title: string;
+  offense: FightAnalytics["offense"];
+  defense: FightAnalytics["defense"];
+  heading?: "h2" | "h3";
+}) {
+  const redOff = offense.find((item) => cornerColor(item.corner) === "red")?.combinations;
+  const blueOff = offense.find((item) => cornerColor(item.corner) === "blue")?.combinations;
+  const redVuln = defense.find((item) => cornerColor(item.corner) === "red")?.vulnerability;
+  const blueVuln = defense.find((item) => cornerColor(item.corner) === "blue")?.vulnerability;
+  const Heading = heading;
+  const patterns = patternNames(redOff?.patterns ?? [], blueOff?.patterns ?? []);
+  return (
+    <section className="combo-block">
+      <Heading className={heading === "h3" ? "round-sub" : undefined}>{title}</Heading>
+      <p className="meta">Average punishment is the punishment-meter step on landed punches, not official damage.</p>
+      <div className="combo-tables">
+        <table>
+          <thead>
+            <tr>
+              <th>Measure</th>
+              <th>Red</th>
+              <th>Blue</th>
+            </tr>
+          </thead>
+          <tbody>
+            <Row label="Combinations" red={redOff?.combo_count ?? null} blue={blueOff?.combo_count ?? null} />
+            <Row label="Mean length" red={num(redOff?.mean_combo_length ?? null, 2)} blue={num(blueOff?.mean_combo_length ?? null, 2)} />
+            <Row label="Longest" red={redOff?.max_combo_length ?? null} blue={blueOff?.max_combo_length ?? null} />
+            <Row label="Single shots" red={percentPoints(redOff?.single_shot_percent)} blue={percentPoints(blueOff?.single_shot_percent)} />
+            <Row label="Alternating hands" red={percentPoints(redOff?.alternating_hand_percent)} blue={percentPoints(blueOff?.alternating_hand_percent)} />
+          </tbody>
+        </table>
+        <table>
+          <thead>
+            <tr>
+              <th>Depth</th>
+              <th>Red thrown</th>
+              <th>Red accuracy</th>
+              <th>Red speed</th>
+              <th>Red countered</th>
+              <th>Blue thrown</th>
+              <th>Blue accuracy</th>
+              <th>Blue speed</th>
+              <th>Blue countered</th>
+            </tr>
+          </thead>
+          <tbody>
+            {DEPTHS.map((depth) => {
+              const red = redOff?.by_depth.find((row) => row.depth === depth);
+              const blue = blueOff?.by_depth.find((row) => row.depth === depth);
+              return (
+                <tr key={depth}>
+                  <td>{depth}</td>
+                  <td className="num">{red?.thrown ?? 0}</td>
+                  <td className="num">{pct(red?.accuracy ?? null)}</td>
+                  <td className="num">{num(red?.mean_speed ?? null, 2)}</td>
+                  <td className="num">{pct(red?.countered_rate ?? null)}</td>
+                  <td className="num">{blue?.thrown ?? 0}</td>
+                  <td className="num">{pct(blue?.accuracy ?? null)}</td>
+                  <td className="num">{num(blue?.mean_speed ?? null, 2)}</td>
+                  <td className="num">{pct(blue?.countered_rate ?? null)}</td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+        <table>
+          <thead>
+            <tr>
+              <th>Window</th>
+              <th>Red hit share</th>
+              <th>Red time share</th>
+              <th>Red risk</th>
+              <th>Red opponent accuracy</th>
+              <th>Blue hit share</th>
+              <th>Blue time share</th>
+              <th>Blue risk</th>
+              <th>Blue opponent accuracy</th>
+            </tr>
+          </thead>
+          <tbody>
+            {VULNERABILITY.map(([key, label]) => {
+              const red = redVuln?.[key];
+              const blue = blueVuln?.[key];
+              return (
+                <tr key={key}>
+                  <td>{label}</td>
+                  <td className="num">{percentPoints(red?.hit_share)}</td>
+                  <td className="num">{percentPoints(red?.time_share)}</td>
+                  <td className="num">{num(red?.risk_ratio ?? null, 2)}</td>
+                  <td className="num">{pct(red?.opponent_accuracy ?? null)}</td>
+                  <td className="num">{percentPoints(blue?.hit_share)}</td>
+                  <td className="num">{percentPoints(blue?.time_share)}</td>
+                  <td className="num">{num(blue?.risk_ratio ?? null, 2)}</td>
+                  <td className="num">{pct(blue?.opponent_accuracy ?? null)}</td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+        <div className="log">
+          <table>
+            <thead>
+              <tr>
+                <th>Pattern</th>
+                <th>Red times</th>
+                <th>Red accuracy</th>
+                <th>Red punishment</th>
+                <th>Red per landed</th>
+                <th>Blue times</th>
+                <th>Blue accuracy</th>
+                <th>Blue punishment</th>
+                <th>Blue per landed</th>
+              </tr>
+            </thead>
+            <tbody>
+              {patterns.length === 0 ? (
+                <tr>
+                  <td>None</td>
+                  <td className="num">—</td>
+                  <td className="num">—</td>
+                  <td className="num">—</td>
+                  <td className="num">—</td>
+                  <td className="num">—</td>
+                  <td className="num">—</td>
+                  <td className="num">—</td>
+                  <td className="num">—</td>
+                </tr>
+              ) : (
+                patterns.map((name) => {
+                  const red = redOff?.patterns.find((row) => row.pattern === name);
+                  const blue = blueOff?.patterns.find((row) => row.pattern === name);
+                  return (
+                    <tr key={name}>
+                      <td>{name.replaceAll("_", " ").replaceAll("-", " · ")}</td>
+                      <td className="num">{red?.count ?? "—"}</td>
+                      <td className="num">{red ? pct(red.accuracy) : "—"}</td>
+                      <td className="num">{red ? num(red.mean_punishment_delta, 2) : "—"}</td>
+                      <td className="num">{red ? num(red.mean_punishment_delta_landed, 2) : "—"}</td>
+                      <td className="num">{blue?.count ?? "—"}</td>
+                      <td className="num">{blue ? pct(blue.accuracy) : "—"}</td>
+                      <td className="num">{blue ? num(blue.mean_punishment_delta, 2) : "—"}</td>
+                      <td className="num">{blue ? num(blue.mean_punishment_delta_landed, 2) : "—"}</td>
+                    </tr>
+                  );
+                })
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+  );
 }
 
 function RoundSection({
@@ -553,6 +737,8 @@ function RoundSection({
               <Row label="Square while punching" red={num(redFoot?.square_while_punching_percent ?? null)} blue={num(blueFoot?.square_while_punching_percent ?? null)} suffix="%" />
             </tbody>
           </table>
+
+          <ComboSection title="Combinations" offense={round.offense} defense={round.defense} heading="h3" />
 
           <div className="charts">
             <div className="chart-block">

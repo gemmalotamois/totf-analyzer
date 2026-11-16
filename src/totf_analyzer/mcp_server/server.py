@@ -89,6 +89,7 @@ def get_fighter_stats(path: str, corner: int) -> dict:
                 "accuracy": round_offense.accuracy,
                 "punches_per_minute": round_offense.punches_per_minute,
                 "mean_speed": round_offense.velocity.mean_thrown,
+                "combinations": round_offense.combinations.model_dump(),
             }
         if round_defense is not None:
             row["defense"] = {
@@ -100,6 +101,7 @@ def get_fighter_stats(path: str, corner: int) -> dict:
                 "guard_discipline": round_defense.guard_discipline.model_dump(),
                 "footwork": round_defense.footwork.model_dump(),
                 "head_movement": round_defense.head_movement.model_dump(),
+                "vulnerability": round_defense.vulnerability.model_dump(),
             }
         rounds.append(row)
     return {

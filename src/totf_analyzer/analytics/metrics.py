@@ -9,9 +9,12 @@ from dataclasses import dataclass
 import numpy as np
 
 from totf_analyzer.models.analytics import (
+    CombinationStats,
+    ComboPatternStats,
     CornerRound,
     DecodeNote,
     DefenseStats,
+    DepthStats,
     DirectnessRatio,
     DistanceSpread,
     FightAnalytics,
@@ -33,6 +36,8 @@ from totf_analyzer.models.analytics import (
     SlipSpread,
     TrajectoryStats,
     VelocityStats,
+    VulnerabilityStats,
+    VulnerabilityWindow,
 )
 from totf_analyzer.parser.session import COLOR_CORNER, CORNER_COLOR, ParsedSession, TrackData
 from totf_analyzer.parser.t2sr import (
@@ -96,6 +101,13 @@ ANGLE_CUT_SEC = 0.75
 ANGLE_CUT_RANGE_M = 1.8
 COMBO_GAP_SEC = 0.65
 COMBO_EXIT_SEC = 0.5
+# Counter windows are measured from launch_tick. Throwing wins over recovery.
+THROW_WINDOW_SEC = 0.15
+RECOVERY_WINDOW_SEC = 0.60
+DEPTH_LABELS = ("1", "2", "3", "4", "5+")
+# These trajectory names already say which hand threw. The others get a hand prefix.
+HAND_NAMED_TRAJECTORIES = frozenset({"jab", "cross", "left_hook", "right_hook"})
+VULNERABILITY_WINDOWS = ("while_throwing", "post_punch_recovery", "neutral_guard")
 MIN_RANGE_M = 1.0e-3
 MIN_LINE_M = 1.0e-4
 # Head slip is measured on the same bell span and opponent frame as footwork.
@@ -223,6 +235,7 @@ def _measure(
         )
     )
     moments.sort(key=lambda item: (item.t_sec, item.type))
+    _attach_combinations(session, offense, defense, landed_events, matches, windows or [])
     return (
         offense,
         defense,
@@ -1494,6 +1507,311 @@ def _angle_cuts(
     return cuts
 
 
+@dataclass(frozen=True)
+class _GroupedPunch:
+    punch: PunchRecord
+    span: tuple[int, int] | None = None
+    index: int = 0
+
+
+def _combo_groups(members: list[_GroupedPunch], timestep: float) -> list[list[_GroupedPunch]]:
+    """Split on a launch gap past COMBO_GAP_SEC, and when the round span changes."""
+    ordered = sorted(members, key=lambda item: (item.punch.launch_tick, item.punch.tick, item.index))
+    groups: list[list[_GroupedPunch]] = []
+    for item in ordered:
+        if not groups:
+            groups.append([item])
+            continue
+        previous = groups[-1][-1]
+        gap = (item.punch.launch_tick - previous.punch.launch_tick) * timestep if timestep > 0 else COMBO_GAP_SEC + 1
+        crossed = item.span is not None and previous.span is not None and item.span != previous.span
+        if gap > COMBO_GAP_SEC or crossed:
+            groups.append([item])
+        else:
+            groups[-1].append(item)
+    return groups
+
+
+def _round_span(punch: PunchRecord, windows: list[_RoundWindow]) -> tuple[int, int] | None:
+    for window in windows:
+        if window.warning_tick <= punch.tick <= window.stats_end:
+            return (window.warning_tick, window.stats_end)
+    return None
+
+
+def _pattern_token(hand: str, trajectory: str) -> str:
+    if trajectory in HAND_NAMED_TRAJECTORIES:
+        return trajectory
+    if hand in {"left", "right"}:
+        return f"{hand}_{trajectory}"
+    return trajectory
+
+
+def _hands_alternate(group: list[_GroupedPunch]) -> bool:
+    hands = [item.punch.hand_index for item in group]
+    return all(left != right for left, right in zip(hands, hands[1:]))
+
+
+def _tick_radius(seconds: float, timestep: float) -> int:
+    if timestep <= 0:
+        return 0
+    return int(round(seconds / timestep))
+
+
+def _classify_tick(
+    tick: int,
+    launches: list[int],
+    throw_ticks: int,
+    recovery_ticks: int,
+) -> tuple[str, int | None]:
+    """Return the window name and the launch index the tick belongs to."""
+    throwing: tuple[int, int, int] | None = None
+    recovery: tuple[int, int, int] | None = None
+    for index, launch in enumerate(launches):
+        delta = tick - launch
+        if abs(delta) <= throw_ticks:
+            candidate = (abs(delta), launch, index)
+            if throwing is None or candidate < throwing:
+                throwing = candidate
+        elif throw_ticks < delta <= recovery_ticks:
+            candidate = (delta, launch, index)
+            if recovery is None or candidate < recovery:
+                recovery = candidate
+    if throwing is not None:
+        return "while_throwing", throwing[2]
+    if recovery is not None:
+        return "post_punch_recovery", recovery[2]
+    return "neutral_guard", None
+
+
+def _bell_state_counts(
+    spans: list[tuple[int, int]],
+    launches: list[int],
+    throw_ticks: int,
+    recovery_ticks: int,
+) -> dict[str, int]:
+    counts = {name: 0 for name in VULNERABILITY_WINDOWS}
+    for start, stop in spans:
+        length = stop - start + 1
+        if length <= 0:
+            continue
+        # 0 neutral, 1 recovery, 2 throwing. Throwing is painted last so it wins.
+        state = np.zeros(length, dtype=np.int8)
+        for launch in launches:
+            rel = launch - start
+            rec_lo = max(0, rel + throw_ticks + 1)
+            rec_hi = min(length - 1, rel + recovery_ticks)
+            if rec_lo <= rec_hi:
+                state[rec_lo : rec_hi + 1] = np.maximum(state[rec_lo : rec_hi + 1], 1)
+            thr_lo = max(0, rel - throw_ticks)
+            thr_hi = min(length - 1, rel + throw_ticks)
+            if thr_lo <= thr_hi:
+                state[thr_lo : thr_hi + 1] = 2
+        counts["neutral_guard"] += int(np.count_nonzero(state == 0))
+        counts["post_punch_recovery"] += int(np.count_nonzero(state == 1))
+        counts["while_throwing"] += int(np.count_nonzero(state == 2))
+    return counts
+
+
+def _combination_stats(
+    track: TrackData,
+    rows: list[PunchRow],
+    timestep: float,
+    windows: list[_RoundWindow],
+    countered: set[int],
+) -> CombinationStats:
+    members = [
+        _GroupedPunch(punch, _round_span(punch, windows), index) for index, punch in enumerate(track.punches)
+    ]
+    groups = _combo_groups(members, timestep)
+    lengths = [len(group) for group in groups]
+    multi = [group for group in groups if len(group) >= 2]
+    alternating = sum(1 for group in multi if _hands_alternate(group))
+    depth_thrown = {label: 0 for label in DEPTH_LABELS}
+    depth_landed = {label: 0 for label in DEPTH_LABELS}
+    depth_speeds: dict[str, list[float]] = {label: [] for label in DEPTH_LABELS}
+    depth_countered = {label: 0 for label in DEPTH_LABELS}
+    patterns: dict[str, list[list[_GroupedPunch]]] = defaultdict(list)
+    for group in groups:
+        tokens: list[str] = []
+        for place, member in enumerate(group, start=1):
+            row = rows[member.index]
+            label = "5+" if place >= 5 else str(place)
+            depth_thrown[label] += 1
+            if row.landed:
+                depth_landed[label] += 1
+            if row.speed is not None:
+                depth_speeds[label].append(row.speed)
+            if member.index in countered:
+                depth_countered[label] += 1
+            tokens.append(_pattern_token(row.hand, row.trajectory))
+        patterns["-".join(tokens)].append(group)
+    pattern_rows: list[ComboPatternStats] = []
+    for pattern, instances in patterns.items():
+        thrown = 0
+        landed = 0
+        speeds: list[float] = []
+        instance_damage: list[float] = []
+        landed_deltas: list[float] = []
+        for group in instances:
+            damage = 0.0
+            for member in group:
+                row = rows[member.index]
+                thrown += 1
+                if row.speed is not None:
+                    speeds.append(row.speed)
+                if row.landed:
+                    landed += 1
+                    if row.punishment_delta is not None:
+                        damage += row.punishment_delta
+                        landed_deltas.append(row.punishment_delta)
+            instance_damage.append(damage)
+        pattern_rows.append(
+            ComboPatternStats(
+                pattern=pattern,
+                count=len(instances),
+                length=len(instances[0]),
+                thrown=thrown,
+                landed=landed,
+                accuracy=_ratio(landed, thrown),
+                mean_speed=_mean(speeds),
+                mean_punishment_delta=_mean(instance_damage),
+                mean_punishment_delta_landed=_mean(landed_deltas),
+            )
+        )
+    pattern_rows.sort(key=lambda item: (-item.count, item.pattern))
+    return CombinationStats(
+        combo_count=len(groups),
+        mean_combo_length=_mean([float(length) for length in lengths]),
+        max_combo_length=max(lengths) if lengths else 0,
+        single_shot_percent=_finite(100.0 * sum(1 for length in lengths if length == 1) / len(lengths)) if lengths else None,
+        alternating_hand_percent=_finite(100.0 * alternating / len(multi)) if multi else None,
+        by_depth=[
+            DepthStats(
+                depth=label,
+                thrown=depth_thrown[label],
+                landed=depth_landed[label],
+                accuracy=_ratio(depth_landed[label], depth_thrown[label]),
+                mean_speed=_mean(depth_speeds[label]),
+                countered_count=depth_countered[label],
+                countered_rate=_ratio(depth_countered[label], depth_thrown[label]),
+            )
+            for label in DEPTH_LABELS
+        ],
+        patterns=pattern_rows,
+    )
+
+
+def _vulnerability_window(
+    hits: int,
+    hit_total: int,
+    ticks: int,
+    tick_total: int,
+    opponent_thrown: int,
+    opponent_landed: int,
+) -> VulnerabilityWindow:
+    hit_share = _share(hits, hit_total)
+    time_share = _share(ticks, tick_total)
+    risk = None
+    if hit_share is not None and time_share is not None and time_share > 0:
+        risk = hit_share / time_share
+    return VulnerabilityWindow(
+        hits=hits,
+        hit_share=_finite(hit_share),
+        time_share=_finite(time_share),
+        risk_ratio=_finite(risk),
+        opponent_thrown=opponent_thrown,
+        opponent_landed=opponent_landed,
+        opponent_accuracy=_ratio(opponent_landed, opponent_thrown),
+    )
+
+
+def _vulnerability_stats(
+    launches: list[int],
+    hit_ticks: list[int],
+    opponent_punches: list[PunchRecord],
+    opponent_landed: set[int],
+    spans: list[tuple[int, int]],
+    timestep: float,
+) -> tuple[VulnerabilityStats, set[int]]:
+    throw_ticks = _tick_radius(THROW_WINDOW_SEC, timestep)
+    recovery_ticks = _tick_radius(RECOVERY_WINDOW_SEC, timestep)
+    hit_counts = {name: 0 for name in VULNERABILITY_WINDOWS}
+    countered: set[int] = set()
+    for tick in hit_ticks:
+        window, index = _classify_tick(tick, launches, throw_ticks, recovery_ticks)
+        hit_counts[window] += 1
+        if index is not None:
+            countered.add(index)
+    time_counts = _bell_state_counts(spans, launches, throw_ticks, recovery_ticks)
+    tick_total = sum(time_counts.values())
+    thrown = {name: 0 for name in VULNERABILITY_WINDOWS}
+    landed = {name: 0 for name in VULNERABILITY_WINDOWS}
+    for index, punch in enumerate(opponent_punches):
+        window, _ignored = _classify_tick(punch.launch_tick, launches, throw_ticks, recovery_ticks)
+        thrown[window] += 1
+        if index in opponent_landed:
+            landed[window] += 1
+    hit_total = len(hit_ticks)
+    windows = {
+        name: _vulnerability_window(
+            hit_counts[name],
+            hit_total,
+            time_counts[name],
+            tick_total,
+            thrown[name],
+            landed[name],
+        )
+        for name in VULNERABILITY_WINDOWS
+    }
+    return (
+        VulnerabilityStats(
+            while_throwing=windows["while_throwing"],
+            post_punch_recovery=windows["post_punch_recovery"],
+            neutral_guard=windows["neutral_guard"],
+        ),
+        countered,
+    )
+
+
+def _attach_combinations(
+    session: ParsedSession,
+    offense: list[OffenseStats],
+    defense: list[DefenseStats],
+    landed_events: dict[int, list[EventRecord]],
+    matches: dict[int, dict[int, EventRecord]],
+    windows: list[_RoundWindow],
+) -> None:
+    """Combination tables and the counter windows that mark a punch as countered."""
+    spans = _bell_spans(windows)
+    offense_by = {item.corner: item for item in offense}
+    defense_by = {item.corner: item for item in defense}
+    for track in _ordered(session):
+        opponent = _opponent(session, track.corner)
+        launches = [punch.launch_tick for punch in track.punches]
+        hits = [event.tick for event in landed_events[track.corner]]
+        vulnerability, countered = _vulnerability_stats(
+            launches,
+            hits,
+            session.tracks[opponent].punches,
+            set(matches[opponent]),
+            spans,
+            session.fixed_timestep,
+        )
+        defense_block = defense_by.get(track.corner)
+        if defense_block is not None:
+            defense_block.vulnerability = vulnerability
+        offense_block = offense_by.get(track.corner)
+        if offense_block is not None:
+            offense_block.combinations = _combination_stats(
+                track,
+                offense_block.punches,
+                session.fixed_timestep,
+                windows,
+                countered,
+            )
+
+
 def _combo_angles(
     track: TrackData,
     ticks: np.ndarray,
@@ -1504,30 +1822,22 @@ def _combo_angles(
     covered: bool,
 ) -> tuple[float | None, float | None]:
     exit_ticks = int(round(COMBO_EXIT_SEC / timestep))
-    chosen: list[tuple[PunchRecord, tuple[int, int]]] = []
+    members: list[_GroupedPunch] = []
     for punch in track.punches:
         span = next((item for item in spans if item[0] <= punch.launch_tick <= item[1]), None)
         if span is not None:
-            chosen.append((punch, span))
-    chosen.sort(key=lambda item: (item[0].launch_tick, item[0].tick))
-    if not chosen or not covered:
+            members.append(_GroupedPunch(punch, span))
+    groups = _combo_groups(members, timestep)
+    if not groups or not covered:
         return None, None
-    groups: list[list[tuple[PunchRecord, tuple[int, int]]]] = []
-    for item in chosen:
-        punch, _span = item
-        if groups and (punch.launch_tick - groups[-1][-1][0].launch_tick) * timestep > COMBO_GAP_SEC:
-            groups.append([item])
-        elif not groups:
-            groups.append([item])
-        else:
-            groups[-1].append(item)
     entries: list[float] = []
     exits: list[float] = []
     for group in groups:
-        first, span = group[0]
-        last = group[-1][0]
-        entries.append(_sum_sweep(ticks, sweep, valid, first.launch_tick, min(last.tick, span[1])))
-        exits.append(_sum_sweep(ticks, sweep, valid, last.tick, min(last.tick + exit_ticks, span[1])))
+        first = group[0]
+        last = group[-1]
+        span = first.span or (first.punch.launch_tick, last.punch.tick)
+        entries.append(_sum_sweep(ticks, sweep, valid, first.punch.launch_tick, min(last.punch.tick, span[1])))
+        exits.append(_sum_sweep(ticks, sweep, valid, last.punch.tick, min(last.punch.tick + exit_ticks, span[1])))
     return float(np.mean(entries)), float(np.mean(exits))
 
 
@@ -2243,6 +2553,39 @@ def _static_notes() -> list[DecodeNote]:
             field="offense.speed",
             confidence="inferred",
             note="Speed is the float at punch-record offset 80. Magnitudes fall in a few meters per second and are treated as m/s.",
+        ),
+        DecodeNote(
+            field="offense.combinations",
+            confidence="inferred",
+            note=(
+                f"A new combination starts when launch ticks are more than {COMBO_GAP_SEC:.2f} s apart, "
+                "or the punches fall in different rounds. "
+                "single_shot_percent is the share of combinations with one punch. "
+                "alternating_hand_percent is the share of multi-punch combinations whose hands strictly alternate. "
+                "Depth is the punch's place in the combination: 1, 2, 3, 4, and 5+. "
+                "Accuracy at a depth is landed divided by thrown. "
+                "A punch is countered when an opponent scored hit falls in that punch's throwing or recovery window. "
+                "A pattern is the trajectory sequence. uppercut, overhand, and unknown are prefixed with the hand. "
+                "mean_punishment_delta is the mean, over instances, of the sum of landed punishment steps in the instance. "
+                "A miss or a missing step counts as 0. "
+                "mean_punishment_delta_landed is the mean step on punches in the pattern that landed. "
+                "That step is punishment channels 0+1, not official received damage."
+            ),
+        ),
+        DecodeNote(
+            field="defense.vulnerability",
+            confidence="inferred",
+            note=(
+                "Windows are measured from each of this fighter's launch ticks. "
+                f"while_throwing is within {THROW_WINDOW_SEC:.2f} s before or after a launch. "
+                f"post_punch_recovery is more than {THROW_WINDOW_SEC:.2f} s and at most {RECOVERY_WINDOW_SEC:.2f} s after a launch, "
+                "and not inside a throwing window. "
+                "neutral_guard is every other bell-to-bell tick. "
+                "Each scored hit taken goes to one window. A throwing window wins over recovery, and overlaps go to the closest launch. "
+                "hit_share and time_share are percents of hits taken and of bell-to-bell time. "
+                "risk_ratio is hit_share divided by time_share. "
+                "Opponent accuracy uses the opponent's punch launches that fall in each state."
+            ),
         ),
         DecodeNote(
             field="defense.guard_up_percent",

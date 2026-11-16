@@ -60,6 +60,17 @@ def _cmd_analyze(args: argparse.Namespace) -> None:
             f"  offhand_kept {discipline['offhand_guard_kept_percent']}"
             f"  retraction_returned {discipline['retraction_returned_percent']}"
         )
+        combos = offense["combinations"]
+        length = combos["mean_combo_length"]
+        length_text = "n/a" if length is None else f"{length:.2f}"
+        top = combos["patterns"][0] if combos["patterns"] else None
+        top_text = ""
+        if top is not None:
+            top_text = (
+                f"  top {top['pattern']} x{top['count']}"
+                f"  accuracy {top['accuracy']}  punishment {top['mean_punishment_delta']}"
+            )
+        print(f"  combos {combos['combo_count']}  mean_length {length_text}{top_text}")
     for rnd in payload["rounds"]:
         if not rnd["completed"] or not rnd["offense"]:
             continue
