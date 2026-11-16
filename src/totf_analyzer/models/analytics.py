@@ -120,6 +120,58 @@ class PunchRow(BaseModel):
     speed: float | None = None
     landed: bool
     punishment_delta: float | None = None
+    # Off-hand fields are null without a peak-extension frame. Retraction fields
+    # are also null for a same-hand double-up or a miss inside 800 ms.
+    offhand_in_guard: bool | None = None
+    offhand_drop_m: float | None = None
+    offhand_flare_m: float | None = None
+    retraction_ms: float | None = None
+    retraction_droop_m: float | None = None
+    retraction_directness: float | None = None
+
+
+class MedianP90(BaseModel):
+    median: float | None = None
+    p90: float | None = None
+
+
+class RetractionTime(BaseModel):
+    median: float | None = None
+    mean: float | None = None
+    p90: float | None = None
+
+
+class RetractionDroop(BaseModel):
+    median: float | None = None
+    p90: float | None = None
+    sag_over_10cm_percent: float | None = None
+
+
+class DirectnessRatio(BaseModel):
+    median: float | None = None
+    mean: float | None = None
+
+
+class GuardDisciplineStats(BaseModel):
+    left_guard_up_percent: float | None = None
+    right_guard_up_percent: float | None = None
+    both_guard_up_percent: float | None = None
+    either_guard_up_percent: float | None = None
+    left_guard_up_percent_under_fire: float | None = None
+    right_guard_up_percent_under_fire: float | None = None
+    both_guard_up_percent_under_fire: float | None = None
+    either_guard_up_percent_under_fire: float | None = None
+    offhand_guard_kept_percent: float | None = None
+    offhand_guard_kept_percent_throwing_left: float | None = None
+    offhand_guard_kept_percent_throwing_right: float | None = None
+    offhand_drop_below_head_m_lead: MedianP90 = Field(default_factory=MedianP90)
+    offhand_drop_below_head_m_rear: MedianP90 = Field(default_factory=MedianP90)
+    offhand_lateral_flare_m_lead: MedianP90 = Field(default_factory=MedianP90)
+    offhand_lateral_flare_m_rear: MedianP90 = Field(default_factory=MedianP90)
+    retraction_returned_percent: float | None = None
+    retraction_time_ms: RetractionTime = Field(default_factory=RetractionTime)
+    retraction_droop_m: RetractionDroop = Field(default_factory=RetractionDroop)
+    retraction_directness_ratio: DirectnessRatio = Field(default_factory=DirectnessRatio)
 
 
 class OffenseStats(BaseModel):
@@ -149,6 +201,7 @@ class DefenseStats(BaseModel):
     head_joint_index: int | None = None
     punishment_peak: list[float] = Field(default_factory=list)
     received_damage_official: float
+    guard_discipline: GuardDisciplineStats = Field(default_factory=GuardDisciplineStats)
 
 
 class KeyMoment(BaseModel):

@@ -97,6 +97,7 @@ def get_fighter_stats(path: str, corner: int) -> dict:
                 "under_fire_seconds": round_defense.under_fire_seconds,
                 "head_mean_speed": round_defense.head_mean_speed,
                 "received_damage_official": round_defense.received_damage_official,
+                "guard_discipline": round_defense.guard_discipline.model_dump(),
             }
         rounds.append(row)
     return {

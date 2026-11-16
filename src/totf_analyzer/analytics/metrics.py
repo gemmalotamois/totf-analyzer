@@ -12,13 +12,18 @@ from totf_analyzer.models.analytics import (
     CornerRound,
     DecodeNote,
     DefenseStats,
+    DirectnessRatio,
     FightAnalytics,
     Fighter,
+    GuardDisciplineStats,
     HandStats,
     HistogramBin,
     KeyMoment,
+    MedianP90,
     OffenseStats,
     PunchRow,
+    RetractionDroop,
+    RetractionTime,
     RoundScore,
     Series,
     SessionFacts,
@@ -42,6 +47,12 @@ from totf_analyzer.parser.t2sr import (
 # Hands count as "up" when both are within these distances of the head joint.
 GUARD_DY_MAX = 0.38
 GUARD_HORIZ_MAX = 0.40
+# Tighter box for the non-punching glove at the punching hand's peak extension.
+OFFHAND_DY_MAX = 0.28
+OFFHAND_HORIZ_MAX = 0.38
+# Return-to-guard is measured from peak extension until this deadline.
+RETRACTION_WINDOW_SEC = 0.800
+SAG_DROOP_M = 0.10
 # Opponent punch records mark the surrounding ticks as under fire.
 UNDER_FIRE_BEFORE = 6
 UNDER_FIRE_AFTER = 36
@@ -122,6 +133,10 @@ def _measure(
     for corner, track in session.tracks.items():
         defender = _opponent(session, corner)
         matches[corner] = _match_punches(track.punches, landed_events[defender])
+    punch_guards = {
+        corner: _punch_guard(track, session.tracks[_opponent(session, corner)], session.fixed_timestep)
+        for corner, track in session.tracks.items()
+    }
     offense = [
         _offense(
             session,
@@ -131,12 +146,14 @@ def _measure(
             landed_events,
             totals,
             notes,
+            punch_guards[track.corner],
             pace_sec=pace_sec,
         )
         for track in _ordered(session)
     ]
     defense = [
-        _defense(session, track, bodies[track.corner], totals, notes) for track in _ordered(session)
+        _defense(session, track, bodies[track.corner], totals, notes, punch_guards[track.corner])
+        for track in _ordered(session)
     ]
     return (
         offense,
@@ -583,13 +600,16 @@ def _glove_centers(track: TrackData) -> tuple[np.ndarray, np.ndarray]:
 def _body(track: TrackData) -> dict:
     ticks = track.skeleton_ticks.astype(np.int64)
     pos = track.skeleton_pos
+    empty = np.zeros(0, dtype=bool)
     if len(pos) == 0:
         return {
             "head": HEAD,
             "left": None,
             "right": None,
             "ticks": ticks,
-            "guard": np.zeros(0, dtype=bool),
+            "guard": empty,
+            "left_guard": empty,
+            "right_guard": empty,
             "head_xyz": np.zeros((0, 3), dtype=np.float64),
         }
     left_glove, right_glove = _glove_centers(track)
@@ -598,15 +618,16 @@ def _body(track: TrackData) -> dict:
     dy_r = head_xyz[:, 1] - right_glove[:, 1]
     horiz_l = np.linalg.norm(left_glove[:, [0, 2]] - head_xyz[:, [0, 2]], axis=1)
     horiz_r = np.linalg.norm(right_glove[:, [0, 2]] - head_xyz[:, [0, 2]], axis=1)
-    guard = (dy_l < GUARD_DY_MAX) & (dy_r < GUARD_DY_MAX) & (horiz_l < GUARD_HORIZ_MAX) & (
-        horiz_r < GUARD_HORIZ_MAX
-    )
+    left_guard = (dy_l < GUARD_DY_MAX) & (horiz_l < GUARD_HORIZ_MAX)
+    right_guard = (dy_r < GUARD_DY_MAX) & (horiz_r < GUARD_HORIZ_MAX)
     return {
         "head": HEAD,
         "left": L_WRIST,
         "right": R_WRIST,
         "ticks": ticks,
-        "guard": guard,
+        "guard": left_guard & right_guard,
+        "left_guard": left_guard,
+        "right_guard": right_guard,
         "head_xyz": head_xyz,
     }
 
@@ -852,6 +873,181 @@ def _punishment_delta(track: TrackData, tick: int) -> float | None:
     return best
 
 
+@dataclass
+class _PunchGuard:
+    hand: str | None = None
+    offhand_role: str | None = None
+    offhand_in_guard: bool | None = None
+    offhand_drop_m: float | None = None
+    offhand_flare_m: float | None = None
+    # True returned, False missed the window, None excluded or no apex.
+    returned: bool | None = None
+    # Kinematic punches (byte 9 == 0) are the only ones in the aggregate rates.
+    rated: bool = False
+    retraction_ms: float | None = None
+    retraction_droop_m: float | None = None
+    retraction_directness: float | None = None
+
+
+def _lead_hand(stance: str | None) -> str | None:
+    if stance is None:
+        return None
+    name = stance.strip().lower()
+    if name == "orthodox":
+        return "left"
+    if name in {"southpaw", "south paw"}:
+        return "right"
+    return None
+
+
+def _offhand_role(punching_hand: str, stance: str | None) -> str | None:
+    lead = _lead_hand(stance)
+    if lead is None:
+        return None
+    offhand = "right" if punching_hand == "left" else "left"
+    return "lead" if offhand == lead else "rear"
+
+
+def _glove_pair(hand: str, left: np.ndarray, right: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    if hand == "left":
+        return left, right
+    return right, left
+
+
+def _head_drop(head: np.ndarray, glove: np.ndarray) -> tuple[float, float, bool]:
+    drop = max(0.0, float(head[1] - glove[1]))
+    flare = float(np.linalg.norm(glove[[0, 2]] - head[[0, 2]]))
+    kept = drop < OFFHAND_DY_MAX and flare < OFFHAND_HORIZ_MAX
+    return drop, flare, kept
+
+
+def _in_return_box(head: np.ndarray, glove: np.ndarray) -> bool:
+    """Tight head-relative box shared with off-hand kept."""
+    drop = float(head[1] - glove[1])
+    flare = float(np.linalg.norm(glove[[0, 2]] - head[[0, 2]]))
+    return drop < OFFHAND_DY_MAX and flare < OFFHAND_HORIZ_MAX
+
+
+def _extension_peak(
+    glove: np.ndarray,
+    forward: np.ndarray,
+    right: np.ndarray,
+    lo: int,
+    hi: int,
+) -> int | None:
+    if hi - lo < MIN_SKELETON_FRAMES:
+        return None
+    delta = glove[lo:hi] - glove[lo]
+    up = np.array([0.0, 1.0, 0.0])
+    local = np.column_stack((delta @ forward[lo], delta @ up, delta @ right[lo]))
+    peak = int(np.argmax(np.linalg.norm(local, axis=1)))
+    if peak == 0:
+        return None
+    return lo + peak
+
+
+def _return_shape(relative: np.ndarray) -> tuple[float, float]:
+    count = len(relative)
+    if count <= 1:
+        return 0.0, 1.0
+    start = relative[0]
+    end = relative[-1]
+    chord = float(np.linalg.norm(end - start))
+    arc = float(np.linalg.norm(np.diff(relative, axis=0), axis=1).sum())
+    directness = 1.0 if arc <= 1.0e-9 else min(1.0, chord / arc)
+    weights = np.linspace(0.0, 1.0, count)
+    chord_y = start[1] + weights * (end[1] - start[1])
+    droop = float(max(0.0, float((chord_y - relative[:, 1]).max())))
+    return droop, directness
+
+
+def _retraction(
+    ticks: np.ndarray,
+    head: np.ndarray,
+    glove: np.ndarray,
+    apex: int,
+    next_launch: int | None,
+    timestep: float,
+) -> tuple[bool | None, float | None, float | None, float | None]:
+    """Walk from the apex until the glove re-enters the tight box, the next same-hand launch, or 800 ms.
+
+    A glove already inside the box at the apex never left, so that punch is excluded.
+    """
+    if _in_return_box(head[apex], glove[apex]):
+        return None, None, None, None
+    apex_tick = int(ticks[apex])
+    returned_at: int | None = None
+    excluded = False
+    for index in range(apex, len(ticks)):
+        tick = int(ticks[index])
+        if (tick - apex_tick) * timestep > RETRACTION_WINDOW_SEC + 1.0e-9:
+            break
+        if next_launch is not None and tick >= next_launch:
+            excluded = True
+            break
+        if _in_return_box(head[index], glove[index]):
+            returned_at = index
+            break
+    if excluded and returned_at is None:
+        return None, None, None, None
+    if returned_at is None:
+        return False, None, None, None
+    relative = glove[apex : returned_at + 1] - head[apex : returned_at + 1]
+    droop, directness = _return_shape(relative)
+    elapsed = (int(ticks[returned_at]) - apex_tick) * timestep * 1000.0
+    return True, elapsed, droop, directness
+
+
+def _punch_guard(track: TrackData, opponent: TrackData, timestep: float) -> list[_PunchGuard]:
+    punches = track.punches
+    if not punches:
+        return []
+    ticks = track.skeleton_ticks.astype(np.int64)
+    if len(ticks) == 0:
+        return [_PunchGuard() for _ in punches]
+    forward, right = _local_axes(track, opponent)
+    left_glove, right_glove = _glove_centers(track)
+    head = track.skeleton_pos[:, HEAD, :].astype(np.float64)
+    rows: list[_PunchGuard] = []
+    for punch in punches:
+        hand = HAND_LABEL.get(punch.hand_index)
+        if hand is None or punch.launch_tick > punch.tick:
+            rows.append(_PunchGuard())
+            continue
+        lo = int(np.searchsorted(ticks, punch.launch_tick, side="left"))
+        hi = int(np.searchsorted(ticks, punch.tick, side="right"))
+        punching, offhand = _glove_pair(hand, left_glove, right_glove)
+        apex = _extension_peak(punching, forward, right, lo, hi)
+        if apex is None:
+            rows.append(_PunchGuard(hand=hand, offhand_role=_offhand_role(hand, track.stance)))
+            continue
+        drop, flare, kept = _head_drop(head[apex], offhand[apex])
+        later = [
+            other.launch_tick
+            for other in punches
+            if other is not punch and other.hand_index == punch.hand_index and other.launch_tick > int(ticks[apex])
+        ]
+        next_launch = min(later) if later else None
+        returned, elapsed, droop, directness = _retraction(
+            ticks, head, punching, apex, next_launch, timestep
+        )
+        rows.append(
+            _PunchGuard(
+                hand=hand,
+                offhand_role=_offhand_role(hand, track.stance),
+                offhand_in_guard=kept,
+                offhand_drop_m=drop,
+                offhand_flare_m=flare,
+                returned=returned,
+                retraction_ms=elapsed,
+                retraction_droop_m=droop,
+                retraction_directness=directness,
+                rated=punch.kinematics,
+            )
+        )
+    return rows
+
+
 def _offense(
     session: ParsedSession,
     track: TrackData,
@@ -860,6 +1056,7 @@ def _offense(
     landed_events: dict[int, list[EventRecord]],
     totals: dict[int, dict],
     notes: list[DecodeNote],
+    punch_guards: list[_PunchGuard],
     pace_sec: float | None = None,
 ) -> OffenseStats:
     defender = session.tracks[_opponent(session, track.corner)]
@@ -880,6 +1077,7 @@ def _offense(
         delta = _punishment_delta(defender, punch.tick) if landed else None
         hand = labels.get(punch.hand_index, f"hand_{punch.hand_index}")
         trajectory = trajectories[index]
+        guard = punch_guards[index]
         row = PunchRow(
             t_sec=_sec(session, punch.tick),
             tick=punch.tick,
@@ -889,6 +1087,12 @@ def _offense(
             speed=_finite(punch.speed),
             landed=landed,
             punishment_delta=_finite(delta),
+            offhand_in_guard=guard.offhand_in_guard,
+            offhand_drop_m=_finite(guard.offhand_drop_m),
+            offhand_flare_m=_finite(guard.offhand_flare_m),
+            retraction_ms=_finite(guard.retraction_ms),
+            retraction_droop_m=_finite(guard.retraction_droop_m),
+            retraction_directness=_finite(guard.retraction_directness),
         )
         rows.append(row)
         hand_buckets[hand].append(row)
@@ -1022,12 +1226,109 @@ def _under_fire_mask(session: ParsedSession, track: TrackData, body: dict) -> np
     return mask
 
 
+def _mask_percent(mask: np.ndarray) -> float | None:
+    if len(mask) == 0:
+        return None
+    return float(mask.mean() * 100.0)
+
+
+def _share(hits: int, total: int) -> float | None:
+    if total == 0:
+        return None
+    return 100.0 * hits / total
+
+
+def _median_p90(values: list[float]) -> MedianP90:
+    if not values:
+        return MedianP90()
+    samples = np.asarray(values, dtype=np.float64)
+    return MedianP90(
+        median=_finite(float(np.percentile(samples, 50))),
+        p90=_finite(float(np.percentile(samples, 90))),
+    )
+
+
+def _guard_discipline(
+    body: dict,
+    under_fire: np.ndarray,
+    punch_guards: list[_PunchGuard],
+    stance: str | None,
+    corner: int,
+    notes: list[DecodeNote],
+) -> GuardDisciplineStats:
+    left = body["left_guard"]
+    right = body["right_guard"]
+    both = body["guard"]
+    either = left | right if len(left) else left
+    fired = under_fire if len(under_fire) == len(both) else np.zeros(len(both), dtype=bool)
+    usable = [row for row in punch_guards if row.rated and row.offhand_in_guard is not None]
+    throwing_left = [row for row in usable if row.hand == "left"]
+    throwing_right = [row for row in usable if row.hand == "right"]
+    lead = [row for row in usable if row.offhand_role == "lead"]
+    rear = [row for row in usable if row.offhand_role == "rear"]
+    returned = [row for row in punch_guards if row.rated and row.returned is True]
+    missed = [row for row in punch_guards if row.rated and row.returned is False]
+    times = [float(row.retraction_ms) for row in returned if row.retraction_ms is not None]
+    droops = [float(row.retraction_droop_m) for row in returned if row.retraction_droop_m is not None]
+    direct = [float(row.retraction_directness) for row in returned if row.retraction_directness is not None]
+    lead_field = f"defense.{corner}.guard_discipline.lead_rear"
+    if _lead_hand(stance) is None and usable and not any(note.field == lead_field for note in notes):
+        notes.append(
+            DecodeNote(
+                field=lead_field,
+                confidence="unavailable",
+                note="Lead and rear splits need an orthodox or southpaw stance, and this track has neither.",
+            )
+        )
+    sag = _share(sum(1 for value in droops if value > SAG_DROOP_M), len(droops))
+    droop_spread = _median_p90(droops)
+    time_samples = np.asarray(times, dtype=np.float64) if times else None
+    direct_samples = np.asarray(direct, dtype=np.float64) if direct else None
+    return GuardDisciplineStats(
+        left_guard_up_percent=_finite(_mask_percent(left)),
+        right_guard_up_percent=_finite(_mask_percent(right)),
+        both_guard_up_percent=_finite(_mask_percent(both)),
+        either_guard_up_percent=_finite(_mask_percent(either)),
+        left_guard_up_percent_under_fire=_finite(_mask_percent(left[fired])) if fired.any() else None,
+        right_guard_up_percent_under_fire=_finite(_mask_percent(right[fired])) if fired.any() else None,
+        both_guard_up_percent_under_fire=_finite(_mask_percent(both[fired])) if fired.any() else None,
+        either_guard_up_percent_under_fire=_finite(_mask_percent(either[fired])) if fired.any() else None,
+        offhand_guard_kept_percent=_share(sum(1 for row in usable if row.offhand_in_guard), len(usable)),
+        offhand_guard_kept_percent_throwing_left=_share(
+            sum(1 for row in throwing_left if row.offhand_in_guard), len(throwing_left)
+        ),
+        offhand_guard_kept_percent_throwing_right=_share(
+            sum(1 for row in throwing_right if row.offhand_in_guard), len(throwing_right)
+        ),
+        offhand_drop_below_head_m_lead=_median_p90([float(row.offhand_drop_m) for row in lead if row.offhand_drop_m is not None]),
+        offhand_drop_below_head_m_rear=_median_p90([float(row.offhand_drop_m) for row in rear if row.offhand_drop_m is not None]),
+        offhand_lateral_flare_m_lead=_median_p90([float(row.offhand_flare_m) for row in lead if row.offhand_flare_m is not None]),
+        offhand_lateral_flare_m_rear=_median_p90([float(row.offhand_flare_m) for row in rear if row.offhand_flare_m is not None]),
+        retraction_returned_percent=_share(len(returned), len(returned) + len(missed)),
+        retraction_time_ms=RetractionTime(
+            median=_finite(float(np.percentile(time_samples, 50))) if time_samples is not None else None,
+            mean=_finite(float(time_samples.mean())) if time_samples is not None else None,
+            p90=_finite(float(np.percentile(time_samples, 90))) if time_samples is not None else None,
+        ),
+        retraction_droop_m=RetractionDroop(
+            median=droop_spread.median,
+            p90=droop_spread.p90,
+            sag_over_10cm_percent=sag,
+        ),
+        retraction_directness_ratio=DirectnessRatio(
+            median=_finite(float(np.percentile(direct_samples, 50))) if direct_samples is not None else None,
+            mean=_finite(float(direct_samples.mean())) if direct_samples is not None else None,
+        ),
+    )
+
+
 def _defense(
     session: ParsedSession,
     track: TrackData,
     body: dict,
     totals: dict[int, dict],
     notes: list[DecodeNote],
+    punch_guards: list[_PunchGuard],
 ) -> DefenseStats:
     mask = _under_fire_mask(session, track, body)
     guard = body["guard"]
@@ -1078,6 +1379,7 @@ def _defense(
         head_joint_index=int(body["head"]),
         punishment_peak=peaks,
         received_damage_official=float(totals.get(track.corner, {}).get("received_damage", 0.0)),
+        guard_discipline=_guard_discipline(body, mask, punch_guards, track.stance, track.corner, notes),
     )
 
 
@@ -1452,6 +1754,26 @@ def _static_notes() -> list[DecodeNote]:
                 "(0.095 m when the snapshot omits it). "
                 "Under fire is the 0.05 s before through 0.30 s after each opponent punch record. "
                 "Fight-level guard uses bell-to-bell ticks only."
+            ),
+        ),
+        DecodeNote(
+            field="defense.guard_discipline",
+            confidence="inferred",
+            note=(
+                "left, right, both, and either guard use the same head-relative box as guard_up_percent. "
+                f"both_guard_up_percent is that both-hands share. "
+                f"At each punch's peak glove extension, the other glove is kept when its drop below the head "
+                f"is under {OFFHAND_DY_MAX:.2f} m and its horizontal distance is under {OFFHAND_HORIZ_MAX:.2f} m. "
+                "A glove above the head has drop 0. "
+                "Off-hand and retraction rates use kinematic punch records only (byte 9 is 0). "
+                f"Return-to-guard runs from that peak until the punching glove re-enters the same "
+                f"{OFFHAND_DY_MAX:.2f} / {OFFHAND_HORIZ_MAX:.2f} m box, the next same-hand launch, or "
+                f"{RETRACTION_WINDOW_SEC * 1000:.0f} ms. "
+                "A glove already inside that box at the peak, or a next same-hand launch before re-entry, is excluded, not a miss. "
+                "Droop is the largest drop of head-relative glove height below the straight chord from peak to re-entry. "
+                "Directness is that chord length divided by the path length. "
+                "Lead is the left hand for orthodox and the right hand for southpaw. "
+                "Drop and flare medians use linear percentiles."
             ),
         ),
         DecodeNote(
